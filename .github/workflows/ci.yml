@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - run: go vet ./...
+      - run: go test -short -race -count=1 ./...
+
+  integration:
+    name: integration (two NATS servers)
+    runs-on: ubuntu-latest
+    needs: unit
+    env:
+      TOKEN: natslink-itest-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: start two NATS servers
+        run: |
+          docker run -d --name natslink-nats-1 -p 127.0.0.1:4222:4222 nats:latest --auth "$TOKEN"
+          docker run -d --name natslink-nats-2 -p 127.0.0.1:4223:4222 nats:latest --auth "$TOKEN"
+          for i in $(seq 1 30); do
+            if docker logs natslink-nats-1 2>&1 | grep -q 'Server is ready' && \
+               docker logs natslink-nats-2 2>&1 | grep -q 'Server is ready'; then exit 0; fi
+            sleep 1
+          done
+          echo "NATS servers did not become ready"; docker logs natslink-nats-1; exit 1
+      - name: install nats-server binary (mirror integration tests)
+        run: go install github.com/nats-io/nats-server/v2@latest
+      - name: run full suite
+        env:
+          NATS_TEST_URL: nats://${{ env.TOKEN }}@127.0.0.1:4222
+          NATS_TEST_URL2: nats://${{ env.TOKEN }}@127.0.0.1:4223
+        run: go test -race -count=1 -v ./... 2>&1 | tee itest.log
+      - name: no unexpected skips
+        run: |
+          if grep -- '--- SKIP' itest.log; then
+            echo "integration tests were skipped; the servers or the nats-server binary are missing"; exit 1
+          fi
+      - name: stop servers
+        if: always()
+        run: docker rm -f natslink-nats-1 natslink-nats-2 || true
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

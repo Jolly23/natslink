@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: tag matches natslink.Version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          want=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' natslink.go)
+          echo "tag=$tag Version=$want"
+          if [ "$tag" != "$want" ]; then
+            echo "::error::tag v$tag does not match natslink.Version=$want; bump the constant and re-tag"
+            exit 1
+          fi
+      - name: release notes from CHANGELOG.md
+        id: notes
+        run: |
+          body=$(.github/scripts/changelog_section.sh "${GITHUB_REF_NAME#v}")
+          if [ -z "$body" ]; then
+            echo "::error::CHANGELOG.md has no '## [${GITHUB_REF_NAME#v}]' section; add it and re-tag"
+            exit 1
+          fi
+          { echo "body<<NOTES_EOF"; echo "$body"; echo "NOTES_EOF"; } >> "$GITHUB_OUTPUT"
+      - run: go vet ./...
+      - run: go test -short -race -count=1 ./...
+      - name: create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+      - name: warm the Go module proxy
+        run: |
+          GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org GONOSUMDB= GONOSUMCHECK=1 \
+            go list -m "github.com/Jolly23/natslink@${GITHUB_REF_NAME}" || true

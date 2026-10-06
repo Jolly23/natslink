@@ -1,0 +1,4 @@
+itest.log
+*.test
+*.out
+.DS_Store
