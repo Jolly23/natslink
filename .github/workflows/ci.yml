@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Never auto-download a newer toolchain: the Go matrix only means something
+# if a go.mod bump past the oldest supported version makes that job fail.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   unit:
     name: unit (go ${{ matrix.go }})
@@ -18,7 +23,7 @@ jobs:
       matrix:
         go: ["1.25.x", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
@@ -40,7 +45,7 @@ jobs:
     env:
       TOKEN: natslink-itest-token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -74,7 +79,7 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: stable
