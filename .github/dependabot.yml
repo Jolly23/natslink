@@ -7,6 +7,11 @@ updates:
     groups:
       go-deps:
         patterns: ["*"]
+    ignore:
+      # nats.go >= 1.54 requires Go 1.26; this module stays at go 1.25 until
+      # every consumer has moved. Lift this when the go directive is bumped.
+      - dependency-name: github.com/nats-io/nats.go
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
