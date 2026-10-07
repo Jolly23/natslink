@@ -53,7 +53,7 @@ import (
 // Version is the package version. It mirrors the git tag (vX.Y.Z) and is
 // logged at connection start, so operators can see which version each process
 // runs.
-const Version = "1.6.0"
+const Version = "1.6.1"
 
 var (
 	ErrAlreadyStarted = errors.New("natslink: already started")
