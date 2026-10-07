@@ -77,11 +77,13 @@ make one casually.
 
 1. Bump `Version` in `natslink.go` and add the section to `CHANGELOG.md`
    (move items out of `Unreleased`).
-2. Commit, then tag and push:
+2. Land that change on `main` through a pull request (`main` only accepts
+   pull requests), then tag the merge commit and push the tag:
 
    ```bash
+   git checkout main && git pull --ff-only
    git tag -a v1.6.0 -m "natslink v1.6.0"
-   git push origin main v1.6.0
+   git push origin v1.6.0
    ```
 
 3. The `release` workflow verifies that the tag matches `natslink.Version`,
