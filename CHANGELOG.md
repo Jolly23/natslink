@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-07
+
+No library code change; CI and release-process maintenance.
+
+### Changed
+- CI runs with `GOTOOLCHAIN=local`, so the Go 1.25 matrix job fails for real
+  when the `go` directive is raised instead of silently downloading a newer
+  toolchain.
+- GitHub Actions bumped: `actions/checkout` v7, `actions/setup-go` v7,
+  `softprops/action-gh-release` v3.
+- Dependabot ignores nats.go minor and major updates: nats.go 1.54 requires
+  Go 1.26 and this module stays on Go 1.25 for now.
+- `CONTRIBUTING.md`: the release procedure goes through a pull request.
+
 ## [1.6.0] - 2026-10-06
 
 First public release as a standalone Go module at
@@ -118,5 +132,6 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/Jolly23/natslink/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/Jolly23/natslink/releases/tag/v1.6.0
