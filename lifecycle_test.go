@@ -219,3 +219,222 @@ func TestIntegrationStopDuringInitialDialClosesSocket(t *testing.T) {
 		t.Fatal("connection installed after Stop")
 	}
 }
+
+// addressGatedDialer gates dials to one address (the "slow" endpoint) and lets
+// every other address through at once; it records when each address was
+// first dialled.
+type addressGatedDialer struct {
+	slow    string
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	first   map[string]time.Time
+}
+
+func newAddressGatedDialer(slow string) *addressGatedDialer {
+	return &addressGatedDialer{slow: slow, gate: make(chan struct{}), entered: make(chan struct{}), first: make(map[string]time.Time)}
+}
+
+func (d *addressGatedDialer) Dial(network, address string) (net.Conn, error) {
+	d.mu.Lock()
+	if _, ok := d.first[address]; !ok {
+		d.first[address] = time.Now()
+	}
+	d.mu.Unlock()
+	if address == d.slow {
+		d.once.Do(func() { close(d.entered) })
+		<-d.gate
+	}
+	return net.DialTimeout(network, address, 2*time.Second)
+}
+
+func (d *addressGatedDialer) firstDial(address string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.first[address]
+	return t, ok
+}
+
+// Workers are active before any endpoint connects: with the second endpoint's
+// dial gated, messages arriving through the first endpoint are handled, not
+// parked in a queue nobody drains (and dropped once it fills).
+func TestIntegrationWorkersActiveBeforeAllEndpointsConnect(t *testing.T) {
+	skipIfNoServer(t)
+	topic := uniqueTopic("startup")
+	const slow = "127.0.0.1:1" // unreachable, and gated: the second endpoint never gets past Dial during the test
+	d := newAddressGatedDialer(slow)
+	var handled atomic.Int64
+	s, err := NewMirroredSubscriber([]string{testURL(), "nats://" + slow}, SubscriberOptions{
+		Options: Options{Topic: topic, ReportInterval: -1, ExtraNatsOptions: []nats.Option{nats.SetCustomDialer(d)}},
+		Handler: func(*nats.Msg) { handled.Add(1) },
+		Workers: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	go func() { started <- s.Start() }()
+	t.Cleanup(func() { close(d.gate); <-started; s.Stop() })
+	select {
+	case <-d.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second endpoint never reached Dial")
+	}
+	// Endpoint 0 is connected and subscribed while Start is still blocked on endpoint 1.
+	waitUntil(t, 5*time.Second, "endpoint 0 connected", func() bool { return s.links[0].IsConnected() })
+	if err := s.links[0].Conn().FlushTimeout(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := nats.Connect(testURL(), nats.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	const n = 200
+	for i := 0; i < n; i++ {
+		if err := pub.Publish(topic, []byte("m")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pub.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, "messages handled while endpoint 1 still dialling", func() bool { return handled.Load() == n })
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned (%v) before the gated endpoint was released", err)
+	default:
+	}
+	if st := s.Stats(); st.Dropped != 0 || st.QueueLen != 0 {
+		t.Errorf("dropped=%d queue=%d, want 0/0", st.Dropped, st.QueueLen)
+	}
+}
+
+// Members are dialled concurrently: with endpoint 0's four members gated, the
+// first dial of endpoint 1 happens right away instead of after four dial
+// timeouts. No server needed; nothing has to connect.
+func TestMirroredPoolDialsEndpointsConcurrently(t *testing.T) {
+	const slow, fast = "127.0.0.1:1", "127.0.0.1:2"
+	d := newAddressGatedDialer(slow)
+	pool, err := NewMirroredPublisherPool([]string{"nats://" + slow, "nats://" + fast}, 4, PublisherOptions{
+		Options: Options{Topic: "t", ReportInterval: -1, ExtraNatsOptions: []nats.Option{nats.SetCustomDialer(d)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	start := time.Now()
+	go func() { started <- pool.Start() }()
+	t.Cleanup(func() { close(d.gate); <-started; pool.Stop() })
+	waitUntil(t, 3*time.Second, "fast endpoint dialled", func() bool { _, ok := d.firstDial(fast); return ok })
+	at, _ := d.firstDial(fast)
+	if el := at.Sub(start); el > 500*time.Millisecond {
+		t.Errorf("fast endpoint's first dial started %v after Start while slow members were gated; want immediate", el)
+	}
+}
+
+// A configuration failure rolls back every member that succeeded, including
+// one whose dial finishes after the failure: the gated good member is still
+// dialling when the bad URL fails, and must end up stopped.
+func TestMirroredPoolStartFailureStopsLateFinisher(t *testing.T) {
+	const slow = "127.0.0.1:1"
+	d := newAddressGatedDialer(slow)
+	pool, err := NewMirroredPublisherPool([]string{"nats://" + slow, "nats://bad url/"}, 1, PublisherOptions{
+		Options: Options{Topic: "t", ReportInterval: -1, ExtraNatsOptions: []nats.Option{nats.SetCustomDialer(d)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	go func() { started <- pool.Start() }()
+	select {
+	case <-d.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("good member never reached Dial")
+	}
+	time.Sleep(50 * time.Millisecond) // the bad member has failed by now; Start must still be waiting for the gated one
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned %v while a member was still dialling", err)
+	default:
+	}
+	close(d.gate)
+	if err := <-started; err == nil {
+		t.Fatal("Start must fail on the bad URL")
+	}
+	for i, pub := range pool.pubs {
+		switch c := pub.conn.Load(); {
+		case pub.stopped.Load() && (c == nil || c.IsClosed()):
+			// started, then rolled back (the late finisher)
+		case !pub.stopped.Load() && c == nil && !pub.running.Load():
+			// never started (its own Start failed)
+		default:
+			t.Errorf("member %d not rolled back: stopped=%v running=%v conn=%v", i, pub.stopped.Load(), pub.running.Load(), c != nil)
+		}
+	}
+	if err := pool.Start(); !errors.Is(err, ErrAlreadyStarted) && !errors.Is(err, ErrStopped) {
+		t.Errorf("second Start after a failed one = %v, want ErrAlreadyStarted or ErrStopped", err)
+	}
+}
+
+// Start and Stop racing on a subscriber: no WaitGroup misuse, no panic,
+// every outcome consistent (either Start wins and Stop tears it down, or Stop
+// wins and Start reports it). Run many times under the race detector.
+func TestSubscriberStartStopRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s, err := NewSubscriber(SubscriberOptions{
+			Options: Options{URL: "nats://127.0.0.1:1", Topic: "t", ReportInterval: -1},
+			Handler: func(*nats.Msg) {},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = s.Start() }()
+		go func() { defer wg.Done(); s.Stop() }()
+		wg.Wait()
+		s.Stop()
+		if err := s.Start(); !errors.Is(err, ErrStopped) {
+			t.Fatalf("iteration %d: Start after Stop = %v, want ErrStopped", i, err)
+		}
+		if s.links[0].conn.Load() != nil && !s.links[0].stopped.Load() {
+			t.Fatalf("iteration %d: live connection after Stop", i)
+		}
+	}
+}
+
+// A second Start on a running instance is rejected without touching it.
+func TestSecondStartDoesNotRollBack(t *testing.T) {
+	s, err := NewMirroredSubscriber([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, SubscriberOptions{
+		Options: Options{Topic: "t", ReportInterval: -1},
+		Handler: func(*nats.Msg) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if err := s.Start(); !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("second Start = %v, want ErrAlreadyStarted", err)
+	}
+	for i, l := range s.links {
+		if !l.running.Load() || l.stopped.Load() {
+			t.Errorf("endpoint %d was disturbed by the second Start", i)
+		}
+	}
+	pool, _ := NewMirroredPublisherPool([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, 1, PublisherOptions{Options: Options{Topic: "t", ReportInterval: -1}})
+	if err := pool.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Stop()
+	if err := pool.Start(); !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("second pool Start = %v, want ErrAlreadyStarted", err)
+	}
+	if !pool.running.Load() || pool.pubs[0].stopped.Load() {
+		t.Error("pool was disturbed by the second Start")
+	}
+}

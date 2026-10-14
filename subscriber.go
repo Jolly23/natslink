@@ -175,7 +175,13 @@ type Subscriber struct {
 
 	done     chan struct{} // closed by Stop to end the shared worker pool (each link has its own done for its reporter goroutine)
 	stopOnce sync.Once
-	dropped  atomic.Uint64 // worker-queue overflow drops (the queue is shared across endpoints, so is the counter)
+	// lifecycleMu orders Start's worker registration against Stop's close of
+	// done, so workerWG.Add never races workerWG.Wait; started makes Start
+	// single-shot at the instance level (a second Start must not roll back the
+	// first one's endpoints).
+	lifecycleMu sync.Mutex
+	started     bool
+	dropped     atomic.Uint64 // worker-queue overflow drops (the queue is shared across endpoints, so is the counter)
 
 	// Pause / Resume (see those methods; self-healing of partially failed
 	// endpoints was added later). subMu serialises the three parties that read
@@ -286,18 +292,33 @@ func newSubscriber(urls []string, o SubscriberOptions, mirrored bool) (*Subscrib
 // connected, and the subscription takes effect with the connection). An error
 // from any endpoint (essentially only configuration errors such as a bad URL or
 // topic, which should be treated as fatal) rolls back the endpoints already started.
+//
+// The worker pool is started before any endpoint is dialled, so an endpoint
+// that connects early never delivers into a queue nobody drains while another
+// endpoint is still dialling; endpoints are dialled with bounded concurrency
+// (maxConcurrentDials), so startup takes the slowest batch, not the sum.
 func (s *Subscriber) Start() error {
-	for i, l := range s.links {
-		if err := l.start(); err != nil {
-			for _, started := range s.links[:i] {
-				started.stop(false)
-			}
-			return err
-		}
+	s.lifecycleMu.Lock()
+	select {
+	case <-s.done:
+		s.lifecycleMu.Unlock()
+		return ErrStopped
+	default:
 	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return ErrAlreadyStarted
+	}
+	s.started = true
 	for i := 0; i < s.workers; i++ {
 		s.workerWG.Add(1)
 		go s.worker()
+	}
+	s.lifecycleMu.Unlock()
+
+	if err := startAll(s.links, (*link).start, func(l *link) { l.stop(false) }); err != nil {
+		s.Stop() // ends the workers; every endpoint has already been stopped or never started
+		return err
 	}
 	return nil
 }
@@ -335,7 +356,9 @@ func (s *Subscriber) MustStart() {
 // down in reverse dependency order so that the dependency outlives this subscription).
 // Stop is idempotent and safe to call repeatedly; the instance is not reusable afterwards.
 func (s *Subscriber) Stop() {
+	s.lifecycleMu.Lock()
 	s.stopOnce.Do(func() { close(s.done) })
+	s.lifecycleMu.Unlock()
 	// Close the endpoint connections in parallel (each blocks at most stopGrace, see link.stop).
 	var wg sync.WaitGroup
 	for _, l := range s.links {
