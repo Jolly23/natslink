@@ -371,8 +371,14 @@ type Stats struct {
 	// Dropped as a total loss figure.
 	SlowConsumers uint64
 
-	QueueLen int // Current length of the Subscriber worker queue (always 0 in synchronous / go-per-message mode).
-	QueueCap int // Capacity of the Subscriber worker queue (always 0 in synchronous / go-per-message mode).
+	QueueLen int // Current length of the Subscriber worker queue (always 0 in synchronous / go-per-message mode); for a mirrored pool member, its endpoint's send-queue length.
+	QueueCap int // Capacity of the Subscriber worker queue (always 0 in synchronous / go-per-message mode); for a mirrored pool member, its endpoint's send-queue capacity.
+	// QueueDropped is, for a member of a mirrored pool, the number of copies its
+	// endpoint's send queue discarded: queue full (entries or bytes) or still
+	// queued when Stop gave up on a stalled send goroutine. Send failures are
+	// not included (they are this member's Dropped). Always 0 for subscribers
+	// and plain publishers.
+	QueueDropped uint64
 }
 
 func prettySize(bytes uint64) string {

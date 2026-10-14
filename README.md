@@ -455,8 +455,13 @@ Semantics at a glance:
   endpoint queue can take the message is `ErrQueueFull` returned, and only a
   message that every endpoint failed to send counts in the pool-level
   `Dropped()` (settled asynchronously). Send failures on one endpoint show up
-  in that member's `Stats.Dropped`; a backlog shows in its `QueueLen`. A
-  single-endpoint pool keeps the synchronous `Publish` of the plain pool.
+  in that member's `Stats.Dropped`, a backlog in its `QueueLen`, and copies
+  its queue discarded (full, or left over when `Stop` gave up on a stalled
+  send) in its `QueueDropped` (`queue_dropped=` in the status line). `Stop`
+  lets every send goroutine flush its queue first, waits for them in parallel
+  for at most one stop grace, and a concurrent second `Stop` waits for that
+  same sequence. A single-endpoint pool keeps the synchronous `Publish` of the
+  plain pool.
 - **Subscribers share one worker pool and one set of counters.** `Workers` is
   the **total** concurrency cap across endpoints and `QueueSize` is one shared
   queue. Ordering guarantees from `Workers: 1` / `SyncMode` hold only **within
@@ -508,6 +513,7 @@ negative deltas to zero in rate monitors).
 | `Diverged` | sub: endpoints whose connection is alive but whose subscription state disagrees with the paused state (v1.5.1). `> 0` = the healer is retrying; persistently `> 0` → look for `subscription reconcile failed`. Endpoints inside a rebuild window are not counted. pub: always 0 |
 | `SlowConsumers` | Number of slow-consumer **events** in which the client dropped messages (the only loss signal in sync mode; events, not messages, so **do not add to `Dropped`**) |
 | `QueueLen` / `QueueCap` | sub: worker-queue level (0 in sync and goroutine-per-message modes); pub: in a mirrored pool, the send-queue level of the member's endpoint (0 for plain publishers) |
+| `QueueDropped` | pub, mirrored pool member only: copies its endpoint's send queue discarded (queue full by entries or bytes, or still queued when `Stop` gave up on a stalled send goroutine); send failures are counted in `Dropped` instead |
 
 **Wiring monitoring:** subscriber loss = `Dropped` (worker pool) **plus**
 `SlowConsumers` (sync); goroutine-per-message subscribers do not drop and have

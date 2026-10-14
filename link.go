@@ -485,6 +485,9 @@ func (l *link) report() {
 	if s.Deduped > 0 {
 		args = append(args, "deduped", s.Deduped)
 	}
+	if s.QueueDropped > 0 {
+		args = append(args, "queue_dropped", s.QueueDropped)
+	}
 	if s.Paused || s.Pauses > 0 {
 		args = append(args, "paused", s.Paused, "pauses", s.Pauses)
 	}

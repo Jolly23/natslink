@@ -29,11 +29,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   16 MB) and goroutine. `Publish` copies the message once, hands it to every
   queue without blocking and returns `nil` as soon as any queue accepts; a
   stalled endpoint backs up and, when full, drops only its own copies. Send
-  failures surface in the members' `Stats`, a backlog in their `QueueLen` /
-  `QueueCap`, and the pool-level `Dropped` (every endpoint failed) is settled
-  asynchronously. On `Stop` each send goroutine flushes its queue before
-  exiting; the send lines are waited for in parallel, bounded by one stop
-  grace in total. Single-endpoint pools keep the synchronous `Publish`.
+  failures surface in the members' `Stats.Dropped`, a backlog in their
+  `QueueLen` / `QueueCap`, queue discards in the new `Stats.QueueDropped`
+  (`queue_dropped=` in the status line), and the pool-level `Dropped` (every
+  endpoint failed) is settled asynchronously. On `Stop` each send goroutine
+  flushes its queue before exiting; the send lines are waited for in parallel,
+  bounded by one stop grace in total; `Publish` and `Stop` are ordered so an
+  accepted message is never left in a queue, and a concurrent second `Stop`
+  waits for the one stop sequence. Single-endpoint pools keep the synchronous
+  `Publish`.
 - Every mirrored constructor given a single URL degrades to its plain
   counterpart: `NewMirroredPublisher` → `NewPublisherPool(1, opts)`,
   `NewMirroredPublisherPool` → `NewPublisherPool(n, opts)`,

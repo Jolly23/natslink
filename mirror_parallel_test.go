@@ -170,7 +170,7 @@ func TestMirroredPublishQueueFullAccounting(t *testing.T) {
 			t.Fatalf("publish %d: %v (endpoint 1 still has room)", i, err)
 		}
 	}
-	waitFor(t, "endpoint 0 queue to fill", func() bool { return p.groups[0].dropped.Load() == 2 })
+	waitFor(t, "endpoint 0 queue to fill", func() bool { return p.Stats()[0].QueueDropped == 2 })
 	if p.Dropped() != 0 {
 		t.Errorf("pool dropped = %d, want 0 (every message reached endpoint 1's queue)", p.Dropped())
 	}
@@ -178,8 +178,11 @@ func TestMirroredPublishQueueFullAccounting(t *testing.T) {
 	if err := p.Publish([]byte("m")); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("publish with both queues full = %v, want ErrQueueFull", err)
 	}
-	if p.Dropped() != 1 || p.groups[0].dropped.Load() != 3 || p.groups[1].dropped.Load() != 1 {
-		t.Errorf("dropped pool=%d e0=%d e1=%d, want 1/3/1", p.Dropped(), p.groups[0].dropped.Load(), p.groups[1].dropped.Load())
+	// The endpoint drops are public, per member, and separate from send failures.
+	st := p.Stats()
+	if p.Dropped() != 1 || st[0].QueueDropped != 3 || st[1].QueueDropped != 1 || st[0].Dropped != 0 || st[1].Dropped != 0 {
+		t.Errorf("dropped pool=%d queue e0=%d e1=%d member e0=%d e1=%d, want 1/3/1/0/0",
+			p.Dropped(), st[0].QueueDropped, st[1].QueueDropped, st[0].Dropped, st[1].Dropped)
 	}
 }
 
@@ -206,8 +209,8 @@ func TestMirroredPublishQueueBytesBound(t *testing.T) {
 	if err := p.Publish([]byte("123")); err != nil { // 8+3 > 10: endpoint 0 drops, endpoint 1 accepts
 		t.Fatalf("third publish: %v", err)
 	}
-	if got := p.groups[0].dropped.Load(); got != 1 {
-		t.Errorf("endpoint 0 dropped = %d, want 1 (bytes bound)", got)
+	if got := p.Stats()[0].QueueDropped; got != 1 {
+		t.Errorf("endpoint 0 queue dropped = %d, want 1 (bytes bound)", got)
 	}
 	if got := p.groups[0].queuedBytes.Load(); got != 8 {
 		t.Errorf("queued bytes = %d, want 8", got)
@@ -229,8 +232,8 @@ func TestMirroredPublishAllEndpointsFailCountsOnce(t *testing.T) {
 	}
 	waitFor(t, "both endpoints to settle", func() bool { return a.count() == 1 && b.count() == 1 })
 	time.Sleep(20 * time.Millisecond) // settle runs right after the hook returns
-	if p.Dropped() != 0 || p.groups[0].dropped.Load() != 1 {
-		t.Errorf("dropped pool=%d e0=%d, want 0/1", p.Dropped(), p.groups[0].dropped.Load())
+	if p.Dropped() != 0 || p.Stats()[0].QueueDropped != 0 {
+		t.Errorf("dropped pool=%d queue e0=%d, want 0/0 (a send failure is the member's Dropped, not a queue drop)", p.Dropped(), p.Stats()[0].QueueDropped)
 	}
 	b.fail(errors.New("boom too"))
 	if err := p.Publish([]byte("y")); err != nil {
@@ -260,13 +263,14 @@ func TestMirroredPublishStopDrainsStalledQueue(t *testing.T) {
 	if el := time.Since(start); el > stopGrace+2*time.Second {
 		t.Errorf("Stop took %v with a stalled endpoint, want <= stopGrace + member stop", el)
 	}
-	if got := p.groups[0].dropped.Load(); got != 4 {
-		t.Errorf("endpoint 0 dropped on stop = %d, want 4 (queued leftovers)", got)
+	st := p.Stats()
+	if got := st[0].QueueDropped; got != 4 {
+		t.Errorf("endpoint 0 queue dropped on stop = %d, want 4 (queued leftovers)", got)
 	}
 	// The healthy endpoint flushed its whole backlog before exiting: nothing
 	// accepted by Publish was lost to the shutdown.
-	if got := b.count(); got != 5 || p.groups[1].dropped.Load() != 0 {
-		t.Errorf("healthy endpoint delivered %d (dropped %d) on stop, want 5 / 0", got, p.groups[1].dropped.Load())
+	if got := b.count(); got != 5 || st[1].QueueDropped != 0 {
+		t.Errorf("healthy endpoint delivered %d (queue dropped %d) on stop, want 5 / 0", got, st[1].QueueDropped)
 	}
 	if err := p.Publish([]byte("late")); !errors.Is(err, ErrStopped) {
 		t.Errorf("publish after stop = %v, want ErrStopped", err)
@@ -348,26 +352,92 @@ func TestMirrorSingleURLDegradesToPlain(t *testing.T) {
 }
 
 // Concurrent publishers against a mirrored pool during Stop: no panic, no
-// race, every message either queued or rejected with a package error.
+// race, and every message Publish accepted (nil) is accounted for on every
+// endpoint, either sent or counted as a queue drop. Nothing may be left in a
+// queue after Stop (the Publish-vs-Stop ordering), so
+// 2 x accepted == sent(e0) + sent(e1) + queueDropped(e0) + queueDropped(e1).
 func TestMirroredPublishConcurrentWithStop(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		p, a, b := newTwoEndpointPool(t)
+		slow := func(bs *blockingSend) func([]byte) error {
+			return func(d []byte) error { time.Sleep(50 * time.Microsecond); return bs.send(d) } // a little backlog at Stop
+		}
+		p.groups[0].testSend, p.groups[1].testSend = slow(a), slow(b)
+		if err := p.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		var (
+			wg       sync.WaitGroup
+			accepted atomic.Int64
+		)
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 300; i++ {
+					err := p.Publish([]byte("race"))
+					switch {
+					case err == nil:
+						accepted.Add(1)
+					case errors.Is(err, ErrStopped), errors.Is(err, ErrQueueFull):
+					default:
+						t.Errorf("unexpected publish error: %v", err)
+					}
+				}
+			}()
+		}
+		time.Sleep(2 * time.Millisecond)
+		p.Stop()
+		wg.Wait()
+		p.Stop() // idempotent
+		st := p.Stats()
+		if st[0].QueueLen != 0 || st[1].QueueLen != 0 {
+			t.Fatalf("round %d: messages left in queues after Stop: %d / %d", round, st[0].QueueLen, st[1].QueueLen)
+		}
+		if got, want := int64(a.count()+b.count())+int64(st[0].QueueDropped+st[1].QueueDropped), 2*accepted.Load(); got != want {
+			t.Fatalf("round %d: accepted %d publishes but endpoints account for %d copies (sent %d+%d, queue-dropped %d+%d)",
+				round, accepted.Load(), got, a.count(), b.count(), st[0].QueueDropped, st[1].QueueDropped)
+		}
+	}
+}
+
+// Two concurrent Stops are one stop sequence: the second waits for the first
+// instead of stopping the members while the send goroutines are still
+// flushing. The send hook pauses in front of the real publish, so without the
+// guard the members would already be stopped when the publish runs and the
+// accepted message would be lost (Dropped=1); with it the publish reaches the
+// members' reconnect buffers (no server) and nothing is lost.
+func TestMirroredPublishConcurrentStopIsOneSequence(t *testing.T) {
 	p, _, _ := newTwoEndpointPool(t)
+	gate := make(chan struct{})
+	for _, g := range p.groups {
+		g := g
+		g.testSend = func(d []byte) error { <-gate; return g.publish(d) }
+	}
 	if err := p.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 500; i++ {
-				if err := p.Publish([]byte("race")); err != nil && !errors.Is(err, ErrStopped) && !errors.Is(err, ErrQueueFull) {
-					t.Errorf("unexpected publish error: %v", err)
-				}
-			}
-		}()
+	if err := p.Publish([]byte("m")); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
-	p.Stop()
+	waitFor(t, "both sends in flight", func() bool {
+		st := p.Stats()
+		return st[0].QueueLen == 0 && st[1].QueueLen == 0 && p.groups[0].queuedBytes.Load() == 0 && p.groups[1].queuedBytes.Load() == 0
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); p.Stop() }()
+	}
+	time.Sleep(100 * time.Millisecond) // both Stops are now inside / waiting on the sequence
+	close(gate)
 	wg.Wait()
-	p.Stop() // idempotent
+	if p.Dropped() != 0 {
+		t.Errorf("pool dropped = %d, want 0 (the accepted message must reach the members before they stop)", p.Dropped())
+	}
+	for i, st := range p.Stats() {
+		if st.Dropped != 0 || st.QueueDropped != 0 {
+			t.Errorf("member %d dropped=%d queue_dropped=%d, want 0/0", i, st.Dropped, st.QueueDropped)
+		}
+	}
 }

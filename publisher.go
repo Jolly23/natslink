@@ -153,6 +153,13 @@ type PublisherPool struct {
 	async   bool
 	running atomic.Bool
 	stopped atomic.Bool
+	// stopMu orders Publish against Stop in a mirrored pool: Publish checks
+	// stopped and enqueues under the read lock, Stop flips stopped under the
+	// write lock before telling the send goroutines to exit, so no message can
+	// slip into a queue nobody will ever drain. stopOnce makes the whole stop
+	// sequence run exactly once, with concurrent callers waiting for it.
+	stopMu   sync.RWMutex
+	stopOnce sync.Once
 }
 
 // Per-endpoint send queue bounds for mirrored pools. Entries bound the
@@ -176,7 +183,7 @@ type pubGroup struct {
 	queue       chan *mirrorMsg
 	queuedBytes atomic.Int64
 	maxBytes    int64
-	dropped     atomic.Uint64 // copies this endpoint discarded: queue full, or every member failed
+	dropped     atomic.Uint64 // copies this endpoint's queue discarded: queue full, or still queued at Stop (send failures are the members' Stats.Dropped)
 	done        chan struct{}
 	wg          sync.WaitGroup
 	testSend    func(data []byte) error // test hook replacing publish on the send goroutine
@@ -215,6 +222,7 @@ func (p *PublisherPool) enableAsync() {
 			pub.statsHook = func(st *Stats) {
 				st.QueueLen = len(g.queue)
 				st.QueueCap = cap(g.queue)
+				st.QueueDropped = g.dropped.Load()
 			}
 		}
 	}
@@ -269,10 +277,7 @@ func (g *pubGroup) send(p *PublisherPool, m *mirrorMsg) {
 	} else {
 		err = g.publish(m.data)
 	}
-	if err != nil {
-		g.dropped.Add(1)
-	}
-	m.settle(p, err != nil)
+	m.settle(p, err != nil) // a failed send is already counted in the member's Stats.Dropped
 }
 
 // drain discards whatever is still queued when the send goroutine did not
@@ -376,7 +381,17 @@ func (p *PublisherPool) WaitConnected(timeout time.Duration) error {
 // than the sum, so the shutdown budget (e.g. systemd TimeoutStopSec) does not
 // shrink linearly with pool size.
 func (p *PublisherPool) Stop() {
-	if p.async && !p.stopped.Swap(true) {
+	p.stopOnce.Do(p.stop)
+}
+
+// stop is the single stop sequence; a concurrent second Stop waits in
+// stopOnce until it has finished rather than stopping the members early
+// underneath the send goroutines that are still flushing.
+func (p *PublisherPool) stop() {
+	p.stopMu.Lock()
+	p.stopped.Store(true)
+	p.stopMu.Unlock()
+	if p.async {
 		// Stop the send lines first so nothing is handed to members that are
 		// closing: each goroutine flushes its queue and exits. One wedged inside
 		// nats.go is waited for at most stopGrace (the member's Stop below
@@ -469,7 +484,12 @@ func (p *PublisherPool) Publish(data []byte) error {
 }
 
 // publishAsync hands one shared copy of data to every endpoint's send queue.
+// It runs under stopMu's read lock so that a message accepted here is always
+// seen by the send goroutines (Stop flips stopped under the write lock before
+// it lets them exit); the lock is uncontended except during Stop.
 func (p *PublisherPool) publishAsync(data []byte) error {
+	p.stopMu.RLock()
+	defer p.stopMu.RUnlock()
 	if p.stopped.Load() {
 		p.dropped.Add(1)
 		return ErrStopped
@@ -581,8 +601,9 @@ func (p *PublisherPool) Dropped() uint64 {
 // Note that each entry's Dropped includes intermediate failover failures; to
 // monitor message loss use the pool-level Dropped() (see its documentation).
 // In a mirrored pool every member of an endpoint also reports that endpoint's
-// send-queue level in QueueLen / QueueCap, so a stalled endpoint shows as a
-// filling queue.
+// send-queue level in QueueLen / QueueCap and the copies its queue discarded
+// in QueueDropped, so a stalled endpoint shows as a filling queue and then as
+// a growing QueueDropped.
 func (p *PublisherPool) Stats() []Stats {
 	out := make([]Stats, 0, len(p.pubs))
 	for _, pub := range p.pubs {
