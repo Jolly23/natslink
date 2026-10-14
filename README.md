@@ -20,10 +20,13 @@ status reporting. You write the handler; the library keeps the pipe alive.
   a failed publish returns an error for the caller to handle.
 - **`PublisherPool`** - N publishers with round-robin and health-first failover.
   Traffic flows through the healthy members while one is reconnecting.
-- **Mirroring** - `NewMirroredPublisherPool` / `NewMirroredSubscriber` fan the
-  same subject out to M *independent* NATS endpoints. Publishes go to every
-  endpoint; subscribers receive every copy. The return types are the plain
-  `*PublisherPool` / `*Subscriber`, so the rest of your code does not change.
+- **Mirroring** - `NewMirroredPublisher` / `NewMirroredPublisherPool` /
+  `NewMirroredSubscriber` fan the same subject out to M *independent* NATS
+  endpoints. Publishes go to every endpoint; subscribers receive every copy,
+  or exactly one when you opt in to the built-in **`DedupSet`** (byte-identical
+  copies collapse without decoding, first arrival wins). The return types are
+  the plain `*PublisherPool` / `*Subscriber`, so the rest of your code does not
+  change.
 
 Only two dependencies: `nats.go` and the standard library.
 
@@ -240,6 +243,31 @@ it. With nats.go 1.53 a SUB / UNSUB on a live connection only fails while the
 connection is draining (after which it closes and rebuild takes over), so this
 is a correctness backstop rather than a hot path.
 
+**Deduplication** (v1.7.0): `Dedup: natslink.NewDedupSet(entries, window)`
+drops a message whose payload is byte-identical to one recorded recently,
+before it is queued or dispatched (`Stats.Deduped`). It exists for mirrored
+subscriptions, where every message arrives once per endpoint: the first copy
+wins and the others never reach the handler, the queue or a goroutine. The set
+remembers the last `entries` distinct payloads (`0` = 4096) as 64-bit
+`hash/maphash` values in a ring buffer plus a presized map, so a check is one
+hash outside the lock and one map lookup inside it, with no allocation after
+warm-up; a hit does not refresh the entry, so flooding one message cannot pin
+it. The window is a capacity, optionally bounded by age (`window > 0` makes an
+entry older than that stop counting, so a legitimately re-sent identical
+message on a quiet subject is not swallowed minutes later; `0` disables age
+expiry). Memory is about 40 bytes per entry. One set can be shared by several
+subscribers, in which case identical payloads on different subjects collapse
+too. Empty payloads bypass the set. `DedupKey func(*nats.Msg) (uint64, bool)`
+replaces the payload hash with a key you compute (for example a hash already
+present at a fixed offset, sparing the hash of a multi-megabyte message);
+`ok=false` delivers without consulting the set. What the set does **not** do:
+collapse messages that carry the same content in different bytes (a sender
+field, a timestamp), so content-level deduplication (sequence numbers, a hash
+carried in the payload) stays in the application; and it is a latency and CPU
+saving, not a delivery guarantee: a copy arriving after the set has forgotten
+the first one is delivered again. Hashing cost is the only per-message cost:
+about 50 ns for 64 B, 0.3 µs for 4 KB and 130 µs for 2 MB on one core.
+
 Subjects pass straight through to NATS, so subscriptions may use wildcards
 (`*` / `>`); one connection still binds exactly one subject expression. Client
 buffer limits (`PendingMsgLimit` / `PendingBytesLimit`) are documented on
@@ -347,36 +375,48 @@ error and increments the pool-level `Dropped()`.
 
 ## Mirroring (active-active across independent NATS endpoints)
 
-`NewMirroredPublisherPool` / `NewMirroredSubscriber` mirror one subject across
-M **mutually independent** NATS endpoints: each publish goes to every endpoint,
-each subscriber subscribes on every endpoint and the handler receives every
-copy. **Mirroring is only a constructor.** The returned types are the plain
-`*PublisherPool` / `*Subscriber`; every method behaves the same and the host
-code changes on exactly one line.
+`NewMirroredPublisher` / `NewMirroredPublisherPool` / `NewMirroredSubscriber`
+mirror one subject across M **mutually independent** NATS endpoints: each
+publish goes to every endpoint, each subscriber subscribes on every endpoint
+and the handler receives every copy (or exactly one with a `DedupSet`, see
+"Subscribing"). **Mirroring is only a constructor.** The returned types are the
+plain `*PublisherPool` / `*Subscriber`; every method behaves the same and the
+host code changes on exactly one line.
 
 Typical setup: one machine runs two local leaf nodes that connect upstream to
 different regions (two trees that never meet). Publishing races both entry
-points; subscribing takes the minimum of both paths. **Deduplication always
-belongs to the consumer** (hash LRU, monotonic sequence numbers, a pool that
-rejects duplicates); the mirror never deduplicates.
+points; subscribing takes the minimum of both paths. The library collapses
+**byte-identical** copies when asked to; **content-level deduplication stays
+with the consumer** (monotonic sequence numbers, a hash carried in the
+payload), because two publishers describing the same event in different bytes
+are not duplicates to the library.
+
+`NewMirroredPublisher(urls, opts)` is the single-connection-per-endpoint form
+(at most 5 endpoints; a publish is sent once per endpoint, so the fan-out is
+deliberately capped). With exactly one URL it degrades to an ordinary
+single-connection publisher (no `-e<i>` suffix, same behaviour as
+`NewPublisher`), so a deployment can grow from one tree to several without a
+code change. `NewMirroredPublisherPool(urls, n, opts)` gives each endpoint `n`
+connections when one is not enough.
 
 ```go
 urls := []string{"nats://tk@127.0.0.1:4222", "nats://tk@127.0.0.1:4223"}
 natslink.MustProbeEach(urls...) // fail fast per endpoint: M endpoints are M promises
 
-pool, err := natslink.NewMirroredPublisherPool(urls, 4, natslink.PublisherOptions{
+pub, err := natslink.NewMirroredPublisher(urls, natslink.PublisherOptions{
     Options: natslink.Options{Topic: "events.tx", Name: "edge-pub-tx", Logger: slog.Default()},
 })
 if err != nil {
     panic(err)
 }
-pool.MustStart()
-defer pool.Stop()
-_ = pool.Publish(payload) // sent once per endpoint; nil if any endpoint accepted
+pub.MustStart()
+defer pub.Stop()
+_ = pub.Publish(payload) // sent once per endpoint; nil if any endpoint accepted
 
 sub, err := natslink.NewMirroredSubscriber(urls, natslink.SubscriberOptions{
     Options: natslink.Options{Topic: "events.block", Name: "edge-sub-block", Logger: slog.Default()},
-    Handler: onBlock, // receives every copy from every endpoint; deduplicate here
+    Handler: onBlock,                              // called once per block: the first copy wins
+    Dedup:   natslink.NewDedupSet(4096, 2*time.Second), // byte-identical copies from the other endpoint are dropped
 })
 ```
 
@@ -412,9 +452,12 @@ Semantics at a glance:
   does not survive mirroring. M endpoints have M delivery goroutines, so the
   handler is called **concurrently**. A handler relying on sync mode to avoid
   locks is a data race under mirroring (there is a test proving it).
-- **Mirrored `Dropped` counts copies.** Each message occupies M queue slots, so
-  under overload `Dropped` is inflated by roughly M. Content is lost only when
-  **all** copies of a message are dropped; divide by M before judging.
+- **Mirrored `Dropped` counts copies unless you deduplicate.** Without a
+  `DedupSet` each message occupies M queue slots, so under overload `Dropped`
+  is inflated by roughly M and content is lost only when **all** copies of a
+  message are dropped; divide by M before judging. With a `DedupSet` only the
+  first copy reaches the queue, `Deduped` grows by M-1 per message in steady
+  state, and `Dropped` means what it means for a single connection.
 - **Each endpoint heals independently and knows nothing of the others.** One
   endpoint down for a long time = the race degrades to a single path (no loss,
   half the benefit).
@@ -440,6 +483,7 @@ negative deltas to zero in rate monitors).
 | `InMsgs` / `OutMsgs` / `InBytes` / `OutBytes` | Traffic counters |
 | `Dropped` | pub: failed publishes; sub: worker-queue overflow drops (**worker-pool mode only**; always 0 in sync and goroutine-per-message modes) |
 | `Gated` | sub: messages dropped by the `Gate` at the delivery entry point (all modes; 0 without a gate; counts copies under mirroring) |
+| `Deduped` | sub: copies dropped by the `DedupSet` after the gate and before the queue (all modes; 0 without a set; M-1 per message in a healthy M-endpoint mirror) |
 | `Paused` / `Pauses` | sub: whether currently paused (connection up, subscription withdrawn) / number of successful pause transitions (idempotent repeats not counted). pub: always `false` / 0 |
 | `Diverged` | sub: endpoints whose connection is alive but whose subscription state disagrees with the paused state (v1.5.1). `> 0` = the healer is retrying; persistently `> 0` → look for `subscription reconcile failed`. Endpoints inside a rebuild window are not counted. pub: always 0 |
 | `SlowConsumers` | Number of slow-consumer **events** in which the client dropped messages (the only loss signal in sync mode; events, not messages, so **do not add to `Dropped`**) |

@@ -13,17 +13,19 @@ import (
 // local leaf nodes, each with its own upstream: a publish is sent once to each
 // endpoint (two ingress paths racing on the sending side), and a subscription
 // is made on each endpoint with the callback receiving every copy (the
-// receiving side takes the min of two paths). Deduplication always happens on
-// the consumer side (hash LRU / sequence-based rejection / pool dedup); the
-// mirror itself never judges duplicates.
+// receiving side takes the min of two paths). Byte-identical copies can be
+// collapsed in the library with SubscriberOptions.Dedup (opt-in; the first
+// copy to arrive wins); content-level deduplication (sequence numbers, a hash
+// carried in the payload) stays on the consumer side.
 //
 // Mirroring is only a construction mode: the returned types are the ordinary
 // ones (*PublisherPool / *Subscriber), every method works the same, and the
 // host code is unaware of it except for the New line. Each endpoint is
 // supervised and self-healed independently, with no knowledge of the others.
 // There is deliberately no cross-endpoint intelligence (no routing, no
-// deduplication, no state synchronisation): the whole semantics of a mirror
-// is "do it once on every endpoint".
+// state synchronisation): the whole semantics of a mirror is "do it once on
+// every endpoint", with the optional DedupSet as the only place where copies
+// meet.
 //
 // Relation to comma-separated URLs (do not confuse the two): the comma list in
 // Options.URL is ordered failover within one endpoint, i.e. only one server is
@@ -42,6 +44,47 @@ import (
 // mirrored copies are collapsed into one or even black-holed against each
 // other. The two leaf nodes must have different names.
 // For startup fail-fast, call MustProbe once per endpoint URL.
+
+// maxMirroredPublisherEndpoints bounds NewMirroredPublisher: every publish is
+// sent once per endpoint, so the fan-out multiplies bandwidth and latency
+// work; beyond a handful of trees the caller is almost certainly
+// misconfiguring something (a cluster's members instead of independent trees).
+const maxMirroredPublisherEndpoints = 5
+
+// NewMirroredPublisher creates one publishing connection per endpoint, at most
+// maxMirroredPublisherEndpoints (5) endpoints, and returns them as a
+// *PublisherPool whose Publish sends once per endpoint and returns nil as soon
+// as any endpoint accepts (see PublisherPool.Publish). Connections are named
+// <Name>-e<endpoint index>. With a single URL there is nothing to mirror: the
+// result is an ordinary single-connection publisher wrapped in a pool
+// (connection named <Name>, no suffix), so a configuration can grow from one
+// endpoint to several without changing the host code. Use
+// NewMirroredPublisherPool when each endpoint needs several connections.
+func NewMirroredPublisher(urls []string, o PublisherOptions) (*PublisherPool, error) {
+	if err := validateMirrorURLs(urls); err != nil {
+		return nil, err
+	}
+	if len(urls) > maxMirroredPublisherEndpoints {
+		return nil, fmt.Errorf("natslink: mirrored publisher allows at most %d endpoints, got %d", maxMirroredPublisherEndpoints, len(urls))
+	}
+
+	pool := &PublisherPool{maxPayload: o.MaxPayload}
+	base := o.Options.Name
+	for e, u := range urls {
+		eo := o
+		eo.Options.URL = u
+		if len(urls) > 1 {
+			eo.Options.Name = mirrorEndpointName(base, "pub", o.Options.Topic, e)
+		}
+		pub, err := NewPublisher(eo)
+		if err != nil {
+			return nil, err
+		}
+		pool.groups = append(pool.groups, &pubGroup{pubs: []*Publisher{pub}})
+		pool.pubs = append(pool.pubs, pub)
+	}
+	return pool, nil
+}
 
 // NewMirroredPublisherPool creates, for each of the M endpoints, a group of n
 // publishing connections on the same topic (not yet connected; call Start).

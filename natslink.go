@@ -53,7 +53,7 @@ import (
 // Version is the package version. It mirrors the git tag (vX.Y.Z) and is
 // logged at connection start, so operators can see which version each process
 // runs.
-const Version = "1.6.1"
+const Version = "1.7.0"
 
 var (
 	ErrAlreadyStarted = errors.New("natslink: already started")
@@ -353,6 +353,12 @@ type Stats struct {
 	// Under a mirrored subscriber it is, like Dropped, a single value shared
 	// across endpoints and likewise counted per copy.
 	Gated uint64
+	// Deduped is the number of messages the subscriber dropped at the delivery
+	// entry point because SubscriberOptions.Dedup had already seen a
+	// byte-identical payload (one per dropped copy; under mirroring the
+	// expected steady-state value is (endpoints-1) per message). Always 0
+	// without a DedupSet and for publishers.
+	Deduped uint64
 	// SlowConsumers is the number of times the subscriber was too slow and the
 	// NATS client discarded messages (ErrSlowConsumer). The connection still
 	// looks healthy at that point, so this counter is the key signal for

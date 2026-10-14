@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-14
+
+### Added
+- `DedupSet` (`NewDedupSet(entries, window)`) and `SubscriberOptions.Dedup` /
+  `DedupKey`: opt-in, allocation-free deduplication of byte-identical payloads
+  at the delivery entry point, so a mirrored subscription delivers each
+  message once (first copy wins) instead of once per endpoint. FIFO set of
+  64-bit `hash/maphash` values with an optional age bound; one set may be
+  shared by several subscribers. New `Stats.Deduped` counter and `deduped=`
+  field in the status line.
+- `NewMirroredPublisher(urls, opts)`: one publishing connection per endpoint,
+  at most 5 endpoints, returned as a `*PublisherPool`; with a single URL it is
+  an ordinary single-connection publisher, so a configuration can grow from
+  one tree to several without a code change.
+
+### Changed
+- README: mirroring no longer says deduplication always belongs to the
+  consumer; byte-identical copies can be collapsed in the library, content-level
+  deduplication still cannot.
+
 ## [1.6.1] - 2026-10-07
 
 No library code change; CI and release-process maintenance.
@@ -132,6 +152,7 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/Jolly23/natslink/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/Jolly23/natslink/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/Jolly23/natslink/releases/tag/v1.6.0

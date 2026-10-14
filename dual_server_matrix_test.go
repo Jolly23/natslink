@@ -621,3 +621,94 @@ func TestDualServerStallPeerBoundedStop(t *testing.T) {
 	close(stopPump)
 	pumpWG.Wait() // Publish on a stopped pool returns immediately, so the pumps exit at once; a hang here would itself be a defect
 }
+
+// -- 6. Mirrored publisher + deduplicating mirrored subscriber: exactly once --
+// NewMirroredPublisher sends every payload to both trees. A mirrored
+// subscriber with a DedupSet delivers each payload exactly once (the first
+// copy wins); a control mirrored subscriber without one still sees both
+// copies, and a single-tree subscriber still sees exactly one, so dedup is
+// purely local to the subscriber that opted in. After the set's capacity is
+// exceeded, a re-sent payload is delivered again (the window is a capacity).
+func TestDualServerMirroredPublisherDedupExactlyOnce(t *testing.T) {
+	skipIfNoDualServers(t)
+	topic := uniqueTopic("dual.dedup")
+	urls := []string{dualURL1(), dualURL2()}
+
+	const capacity = 32
+	dedup := newDualCollector()
+	dsub, err := NewMirroredSubscriber(urls, SubscriberOptions{
+		Options: Options{Topic: topic, ReportInterval: -1},
+		Handler: dedup.handler,
+		Dedup:   NewDedupSet(capacity, 0),
+	})
+	if err != nil {
+		t.Fatalf("NewMirroredSubscriber: %v", err)
+	}
+	dsub.MustStart()
+	t.Cleanup(dsub.Stop)
+	if err := dsub.WaitConnected(5 * time.Second); err != nil {
+		t.Fatalf("dedup subscriber connect: %v", err)
+	}
+	flushSubscriber(t, dsub)
+
+	control := newDualCollector()
+	csub, err := NewMirroredSubscriber(urls, SubscriberOptions{
+		Options: Options{Topic: topic, ReportInterval: -1},
+		Handler: control.handler,
+	})
+	if err != nil {
+		t.Fatalf("NewMirroredSubscriber: %v", err)
+	}
+	csub.MustStart()
+	t.Cleanup(csub.Stop)
+	if err := csub.WaitConnected(5 * time.Second); err != nil {
+		t.Fatalf("control subscriber connect: %v", err)
+	}
+	flushSubscriber(t, csub)
+
+	single := newDualCollector()
+	newDualSub(t, dualURL1(), topic, single, 0)
+
+	pub, err := NewMirroredPublisher(urls, PublisherOptions{Options: Options{Topic: topic, ReportInterval: -1}})
+	if err != nil {
+		t.Fatalf("NewMirroredPublisher: %v", err)
+	}
+	pub.MustStart()
+	t.Cleanup(pub.Stop)
+	if err := pub.WaitConnected(5 * time.Second); err != nil {
+		t.Fatalf("publisher connect: %v", err)
+	}
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		if err := pub.Publish([]byte(fmt.Sprintf("dd-%d", i))); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+	settle(t, "dedup subscriber", n, dedup.totalCount)
+	settle(t, "control subscriber", 2*n, control.totalCount)
+	settle(t, "single-tree subscriber", n, single.totalCount)
+	dedup.assertEachExactly(t, "dd-", n, 1)
+	control.assertEachExactly(t, "dd-", n, 2)
+	single.assertEachExactly(t, "dd-", n, 1)
+	if got := dsub.Stats().Deduped; got != n {
+		t.Errorf("Stats.Deduped = %d, want %d (one dropped copy per payload)", got, n)
+	}
+	if got := csub.Stats().Deduped; got != 0 {
+		t.Errorf("control Stats.Deduped = %d, want 0", got)
+	}
+
+	// Push the first payload out of the set (capacity newer distinct payloads),
+	// then re-send it: it must be delivered again, once.
+	for i := 0; i < capacity; i++ {
+		if err := pub.Publish([]byte(fmt.Sprintf("fill-%d", i))); err != nil {
+			t.Fatalf("publish fill %d: %v", i, err)
+		}
+	}
+	settle(t, "dedup subscriber after fill", n+capacity, dedup.totalCount)
+	if err := pub.Publish([]byte("dd-0")); err != nil {
+		t.Fatalf("re-publish: %v", err)
+	}
+	settle(t, "dedup subscriber after re-send", n+capacity+1, dedup.totalCount)
+	dedup.assertEachExactly(t, "dd-0", 1, 2)
+}
