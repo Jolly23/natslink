@@ -69,6 +69,35 @@ type SubscriberOptions struct {
 	// strict point-in-time semantics must re-check inside Handler.
 	Gate func() bool
 
+	// Dedup, when non-nil, drops a message whose payload is byte-identical to
+	// one the set has recorded recently (Stats.Deduped) before it is queued or
+	// dispatched. It is a general byte-level filter for any subscriber: the
+	// same set may be given to one subscriber, to several (identical payloads
+	// on different subjects then collapse as well, e.g. one event published on
+	// three feeds), or to every subscriber a process owns, and the host may
+	// also call DedupSet.Seen directly on paths that do not go through a
+	// Subscriber. The typical case is a mirrored subscription, where the M
+	// endpoint copies of one message collapse into a single callback without
+	// decoding and the first copy to arrive wins. nil means every message is
+	// delivered (the previous behaviour).
+	//
+	// The check runs after Gate and before the dispatch mode, on the NATS
+	// delivery goroutine: one hash of the payload (outside the set's lock) plus
+	// a short locked map lookup. Messages with an empty payload bypass it.
+	// Only byte-identical copies are collapsed; two messages carrying the same
+	// content in different bytes are not duplicates to the set, so an
+	// application that needs content-level deduplication keeps it. The window
+	// is a capacity (and optionally an age), not a guarantee: a copy arriving
+	// after the set has forgotten the first one is delivered again.
+	Dedup *DedupSet
+
+	// DedupKey, when non-nil, replaces the payload hash with a caller-computed
+	// 64-bit key for the Dedup check (for example a hash already present in the
+	// payload at a fixed offset, saving the hash of a large message). Returning
+	// ok=false delivers the message without consulting the set. Requires Dedup;
+	// runs on the delivery goroutine, so it must be cheap and concurrency-safe.
+	DedupKey func(msg *nats.Msg) (key uint64, ok bool)
+
 	// Workers is the worker-pool goroutine count (bounded concurrency), default 8.
 	// The callback never blocks the NATS delivery goroutine; when the pool cannot
 	// keep up, new messages are dropped and counted (Stats.Dropped, so backpressure
@@ -132,7 +161,10 @@ type Subscriber struct {
 	topic string
 
 	handler    Handler
-	gate       func() bool   // callback admission check, nil = always admit (see SubscriberOptions.Gate)
+	gate       func() bool // callback admission check, nil = always admit (see SubscriberOptions.Gate)
+	dedup      *DedupSet   // byte-identical copy filter, nil = off (see SubscriberOptions.Dedup)
+	dedupKey   func(*nats.Msg) (uint64, bool)
+	deduped    atomic.Uint64 // copies dropped by dedup (Subscriber-wide, summed across endpoints under mirroring)
 	gated      atomic.Uint64 // messages dropped by the gate (Subscriber-wide, summed across endpoints under mirroring)
 	queueGroup string
 
@@ -191,9 +223,15 @@ func newSubscriber(urls []string, o SubscriberOptions, mirrored bool) (*Subscrib
 		return nil, errors.New("natslink: SubscriberOptions.Handler is required")
 	}
 
+	if o.DedupKey != nil && o.Dedup == nil {
+		return nil, errors.New("natslink: SubscriberOptions.DedupKey requires Dedup")
+	}
+
 	s := &Subscriber{
 		handler:           o.Handler,
 		gate:              o.Gate,
+		dedup:             o.Dedup,
+		dedupKey:          o.DedupKey,
 		queueGroup:        o.QueueGroup,
 		done:              make(chan struct{}),
 		pendingMsgLimit:   o.PendingMsgLimit,
@@ -369,7 +407,7 @@ func (s *Subscriber) Conn() *nats.Conn {
 //   - for the plain (single-endpoint) constructor every field matches the previous behaviour.
 func (s *Subscriber) Stats() Stats {
 	paused, diverged := s.subState()
-	out := Stats{Status: "no-conn", Dropped: s.dropped.Load(), Gated: s.gated.Load(), Paused: paused, Pauses: s.pauses.Load(), Diverged: diverged}
+	out := Stats{Status: "no-conn", Dropped: s.dropped.Load(), Gated: s.gated.Load(), Deduped: s.deduped.Load(), Paused: paused, Pauses: s.pauses.Load(), Diverged: diverged}
 	if len(s.links) > 0 {
 		out.Name = s.links[0].o.Name
 	}
@@ -414,6 +452,7 @@ func (s *Subscriber) Stats() Stats {
 func (s *Subscriber) injectSharedStats(st *Stats) {
 	st.Dropped = s.dropped.Load()
 	st.Gated = s.gated.Load()
+	st.Deduped = s.deduped.Load()
 	st.Paused, st.Diverged = s.subState()
 	st.Pauses = s.pauses.Load()
 	if s.msgCh != nil {
@@ -738,10 +777,16 @@ func (s *Subscriber) IsPaused() bool {
 // go-per-message mode it only spawns one goroutine (microseconds, likewise
 // non-blocking); in synchronous mode it calls the handler directly.
 // The Gate is evaluated first, identically in all three modes: a gated-off
-// message is not queued, spawns no goroutine and is not delivered, only counted (Stats.Gated).
+// message is not queued, spawns no goroutine and is not delivered, only counted
+// (Stats.Gated). The DedupSet comes second, so a duplicate copy takes no queue
+// slot and spawns no goroutine either (Stats.Deduped).
 func (s *Subscriber) dispatch(msg *nats.Msg) {
 	if s.gate != nil && !s.gate() {
 		s.gated.Add(1)
+		return
+	}
+	if s.dedup != nil && s.isDuplicate(msg) {
+		s.deduped.Add(1)
 		return
 	}
 	switch {
@@ -771,6 +816,20 @@ func (s *Subscriber) dispatch(msg *nats.Msg) {
 			s.handler(msg)
 		}
 	}
+}
+
+// isDuplicate consults the DedupSet: by the caller's key when DedupKey is set
+// (ok=false bypasses the set), otherwise by a hash of the payload, with empty
+// payloads always delivered.
+func (s *Subscriber) isDuplicate(msg *nats.Msg) bool {
+	if s.dedupKey != nil {
+		key, ok := s.dedupKey(msg)
+		return ok && s.dedup.SeenKey(key)
+	}
+	if len(msg.Data) == 0 {
+		return false
+	}
+	return s.dedup.Seen(msg.Data)
 }
 
 // worker consumes messages from the shared queue and calls the handler

@@ -1,6 +1,7 @@
 package natslink
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -128,10 +129,12 @@ func (p *Publisher) Publish(data []byte) error {
 // PublisherPool is a pool of publishers. The plain constructor
 // (NewPublisherPool) builds N connections to one endpoint: round-robin start
 // position, failover one connection at a time, nil as soon as any one of them
-// accepts the message. The mirrored constructor (NewMirroredPublisherPool)
-// builds N connections to each of M independent endpoints: Publish routes and
-// sends once per endpoint (multi-entry racing on the send side, deduplication
-// on the consumer side) and returns nil as soon as any endpoint accepts.
+// accepts the message. The mirrored constructors (NewMirroredPublisher,
+// NewMirroredPublisherPool) build connections to each of M independent
+// endpoints: every endpoint is an independent send line with its own bounded
+// queue and goroutine, Publish hands one shared copy of the message to each
+// queue without blocking and returns nil as soon as any queue accepts
+// (multi-entry racing on the send side, deduplication on the consumer side).
 // Both constructors return the same type and are used identically apart from construction.
 // While one connection is in a self-healing rebuild, traffic automatically
 // lands on the remaining connections of that endpoint, so 1/N of the messages
@@ -142,12 +145,155 @@ type PublisherPool struct {
 
 	maxPayload int
 	dropped    atomic.Uint64 // messages for which every endpoint failed and the whole message was discarded (true loss at the mirror level)
+
+	// async is set for mirrored pools (two or more endpoints): Publish enqueues
+	// instead of sending, and each group's goroutine does the sending. A plain
+	// pool (one endpoint) keeps the synchronous path, so a single stalled
+	// endpoint cannot delay the others and a single-endpoint pool is unchanged.
+	async   bool
+	running atomic.Bool
+	stopped atomic.Bool
+	// stopMu orders Publish against Stop in a mirrored pool: Publish checks
+	// stopped and enqueues under the read lock, Stop flips stopped under the
+	// write lock before telling the send goroutines to exit, so no message can
+	// slip into a queue nobody will ever drain. stopOnce makes the whole stop
+	// sequence run exactly once, with concurrent callers waiting for it.
+	stopMu   sync.RWMutex
+	stopOnce sync.Once
 }
 
-// pubGroup is one endpoint's members plus its round-robin cursor.
+// Per-endpoint send queue bounds for mirrored pools. Entries bound the
+// goroutine hand-off; bytes bound memory when one endpoint stalls while the
+// others keep draining (the payload copy is shared, so a stalled queue is what
+// keeps it alive). Matched to the reconnect buffer: beyond this much backlog
+// the endpoint is dead for racing purposes and its copies are dropped and
+// counted rather than queued.
+const (
+	mirrorQueueEntries = 4096
+	mirrorQueueBytes   = reconnectBufSize
+)
+
+// pubGroup is one endpoint's members plus its round-robin cursor, and in a
+// mirrored pool its send line: a bounded queue drained by one goroutine.
 type pubGroup struct {
 	pubs   []*Publisher
 	cursor atomic.Uint64
+
+	// Mirrored pools only (nil queue otherwise).
+	queue       chan *mirrorMsg
+	queuedBytes atomic.Int64
+	maxBytes    int64
+	dropped     atomic.Uint64 // copies this endpoint's queue discarded: queue full, or still queued at Stop (send failures are the members' Stats.Dropped)
+	done        chan struct{}
+	wg          sync.WaitGroup
+	testSend    func(data []byte) error // test hook replacing publish on the send goroutine
+}
+
+// mirrorMsg is one message shared read-only by every endpoint's send
+// goroutine, with the bookkeeping that decides whether the message was lost
+// everywhere (the pool-level Dropped).
+type mirrorMsg struct {
+	data      []byte
+	remaining atomic.Int32
+	failed    atomic.Int32
+}
+
+// settle records one endpoint's outcome; the last endpoint to settle counts
+// the message as lost at the pool level if no endpoint accepted it.
+func (m *mirrorMsg) settle(p *PublisherPool, failed bool) {
+	if failed {
+		m.failed.Add(1)
+	}
+	if m.remaining.Add(-1) == 0 && int(m.failed.Load()) == len(p.groups) {
+		p.dropped.Add(1)
+	}
+}
+
+// enableAsync turns a multi-endpoint pool into independent send lines. Called
+// by the mirrored constructors before Start.
+func (p *PublisherPool) enableAsync() {
+	p.async = true
+	for _, g := range p.groups {
+		g.queue = make(chan *mirrorMsg, mirrorQueueEntries)
+		g.maxBytes = mirrorQueueBytes
+		g.done = make(chan struct{})
+		for _, pub := range g.pubs {
+			g := g
+			pub.statsHook = func(st *Stats) {
+				st.QueueLen = len(g.queue)
+				st.QueueCap = cap(g.queue)
+				st.QueueDropped = g.dropped.Load()
+			}
+		}
+	}
+}
+
+// enqueue hands m to this endpoint's send goroutine without blocking; false
+// means the queue is full by entries or bytes and this endpoint's copy is dropped.
+func (g *pubGroup) enqueue(m *mirrorMsg) bool {
+	n := int64(len(m.data))
+	if g.queuedBytes.Add(n) > g.maxBytes {
+		g.queuedBytes.Add(-n)
+		return false
+	}
+	select {
+	case g.queue <- m:
+		return true
+	default:
+		g.queuedBytes.Add(-n)
+		return false
+	}
+}
+
+// run is the endpoint's send goroutine: it performs the two routing passes for
+// each queued message, so a stall inside nats.go (a wedged write holding the
+// connection lock) delays only this endpoint's copies. On Stop it first sends
+// whatever is still queued (those messages were accepted by Publish; a healthy
+// endpoint must not lose them to a shutdown race) and only then exits.
+func (g *pubGroup) run(p *PublisherPool) {
+	defer g.wg.Done()
+	for {
+		select {
+		case <-g.done:
+			for {
+				select {
+				case m := <-g.queue:
+					g.send(p, m)
+				default:
+					return
+				}
+			}
+		case m := <-g.queue:
+			g.send(p, m)
+		}
+	}
+}
+
+func (g *pubGroup) send(p *PublisherPool, m *mirrorMsg) {
+	g.queuedBytes.Add(-int64(len(m.data)))
+	var err error
+	if g.testSend != nil {
+		err = g.testSend(m.data)
+	} else {
+		err = g.publish(m.data)
+	}
+	m.settle(p, err != nil) // a failed send is already counted in the member's Stats.Dropped
+}
+
+// drain discards whatever is still queued when the send goroutine did not
+// finish within the stop grace (the endpoint is stalled), keeping the loss
+// accounting exact.
+func (g *pubGroup) drain(p *PublisherPool) {
+	for {
+		select {
+		case m := <-g.queue:
+			g.queuedBytes.Add(-int64(len(m.data)))
+			g.dropped.Add(1)
+			m.settle(p, true)
+		default:
+			return
+		}
+	}
 }
 
 // newPubGroup builds n publishing connections for one endpoint (members named <Name>-<i>).
@@ -188,6 +334,9 @@ func NewPublisherPool(n int, o PublisherOptions) (*PublisherPool, error) {
 // Start starts every connection in the pool; if any fails (configuration
 // error) the ones already started are stopped and that error is returned.
 func (p *PublisherPool) Start() error {
+	if p.stopped.Load() {
+		return ErrStopped
+	}
 	for i, pub := range p.pubs {
 		if err := pub.Start(); err != nil {
 			for _, started := range p.pubs[:i] {
@@ -196,6 +345,13 @@ func (p *PublisherPool) Start() error {
 			return err
 		}
 	}
+	if p.async {
+		for _, g := range p.groups {
+			g.wg.Add(1)
+			go g.run(p)
+		}
+	}
+	p.running.Store(true)
 	return nil
 }
 
@@ -225,6 +381,40 @@ func (p *PublisherPool) WaitConnected(timeout time.Duration) error {
 // than the sum, so the shutdown budget (e.g. systemd TimeoutStopSec) does not
 // shrink linearly with pool size.
 func (p *PublisherPool) Stop() {
+	p.stopOnce.Do(p.stop)
+}
+
+// stop is the single stop sequence; a concurrent second Stop waits in
+// stopOnce until it has finished rather than stopping the members early
+// underneath the send goroutines that are still flushing.
+func (p *PublisherPool) stop() {
+	p.stopMu.Lock()
+	p.stopped.Store(true)
+	p.stopMu.Unlock()
+	if p.async {
+		// Stop the send lines first so nothing is handed to members that are
+		// closing: each goroutine flushes its queue and exits. One wedged inside
+		// nats.go is waited for at most stopGrace (the member's Stop below
+		// unblocks it anyway); only then is its queue drained with every
+		// leftover counted as dropped.
+		for _, g := range p.groups {
+			close(g.done)
+		}
+		// Wait for the send lines in parallel, so the pool-level bound stays
+		// stopGrace (max), not endpoints x stopGrace (sum), exactly like the
+		// member Stop below.
+		var lines sync.WaitGroup
+		for _, g := range p.groups {
+			lines.Add(1)
+			go func(g *pubGroup) {
+				defer lines.Done()
+				if !waitGroupTimeout(&g.wg, stopGrace) {
+					g.drain(p)
+				}
+			}(g)
+		}
+		lines.Wait()
+	}
 	var wg sync.WaitGroup
 	for _, pub := range p.pubs {
 		wg.Add(1)
@@ -253,13 +443,26 @@ func (p *PublisherPool) Stop() {
 // members: when no member of the endpoint is healthy it falls back to "written
 // into the reconnect buffer counts as success", so the message is buffered rather than dropped.
 //
-// Safe for concurrent use. data is copied synchronously before each underlying
-// Publish returns, so the caller may reuse it immediately.
+// Mirrored pools (two or more endpoints) do not send on the caller's
+// goroutine at all: one copy of data is handed to every endpoint's bounded
+// send queue (non-blocking) and nil means at least one queue accepted it; the
+// endpoint goroutines then run the routing above independently, so a stalled
+// endpoint only backs up its own queue (its copies are dropped once the queue
+// is full, counted on that endpoint) while the others keep sending. Send
+// failures surface asynchronously in the members' Stats, and a message that
+// every endpoint failed to send still counts towards Dropped. ErrQueueFull is
+// returned when no endpoint could take the message.
+//
+// Safe for concurrent use. data is copied before Publish returns, so the
+// caller may reuse it immediately.
 func (p *PublisherPool) Publish(data []byte) error {
 	// The size check is hoisted to the pool level so an oversized message is not counted as Dropped once per connection.
 	if p.maxPayload > 0 && len(data) > p.maxPayload {
 		p.dropped.Add(1)
 		return fmt.Errorf("%w: %s > %s", ErrOversized, prettySize(uint64(len(data))), prettySize(uint64(p.maxPayload)))
+	}
+	if p.async {
+		return p.publishAsync(data)
 	}
 
 	var (
@@ -278,6 +481,50 @@ func (p *PublisherPool) Publish(data []byte) error {
 	}
 	p.dropped.Add(1)
 	return errors.Join(errs...)
+}
+
+// publishAsync hands one shared copy of data to every endpoint's send queue.
+// It runs under stopMu's read lock so that a message accepted here is always
+// seen by the send goroutines (Stop flips stopped under the write lock before
+// it lets them exit); the lock is uncontended except during Stop.
+func (p *PublisherPool) publishAsync(data []byte) error {
+	p.stopMu.RLock()
+	defer p.stopMu.RUnlock()
+	if p.stopped.Load() {
+		p.dropped.Add(1)
+		return ErrStopped
+	}
+	if !p.running.Load() {
+		p.dropped.Add(1)
+		return ErrNotRunning
+	}
+	m := &mirrorMsg{data: bytes.Clone(data)}
+	m.remaining.Store(int32(len(p.groups)))
+	accepted := 0
+	for _, g := range p.groups {
+		if g.enqueue(m) {
+			accepted++
+		} else {
+			g.dropped.Add(1)
+			m.settle(p, true)
+		}
+	}
+	if accepted == 0 {
+		return ErrQueueFull
+	}
+	return nil
+}
+
+// waitGroupTimeout waits for wg at most d and reports whether it finished.
+func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // publish runs the two routing passes within this endpoint starting from the
@@ -336,7 +583,9 @@ func (p *PublisherPool) Endpoints() int {
 }
 
 // Dropped returns the cumulative count of messages for which every endpoint
-// failed and the whole message was discarded.
+// failed and the whole message was discarded. In a mirrored pool this is
+// settled asynchronously, once the last endpoint's send goroutine has handled
+// the message (or dropped it at the queue).
 // This is the pool's true message-loss count: a single connection's
 // Stats.Dropped is the number of failed attempts on that connection, and the
 // message may well have been failed over to another connection (or, under
@@ -351,6 +600,10 @@ func (p *PublisherPool) Dropped() uint64 {
 // urls order; each entry's Name carries the -e<endpoint>-<member> suffix for attribution).
 // Note that each entry's Dropped includes intermediate failover failures; to
 // monitor message loss use the pool-level Dropped() (see its documentation).
+// In a mirrored pool every member of an endpoint also reports that endpoint's
+// send-queue level in QueueLen / QueueCap and the copies its queue discarded
+// in QueueDropped, so a stalled endpoint shows as a filling queue and then as
+// a growing QueueDropped.
 func (p *PublisherPool) Stats() []Stats {
 	out := make([]Stats, 0, len(p.pubs))
 	for _, pub := range p.pubs {
