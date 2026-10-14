@@ -87,8 +87,17 @@ func BenchmarkMirrorEndToEnd(b *testing.B) {
 			if err := sub.WaitConnected(5 * time.Second); err != nil {
 				b.Fatal(err)
 			}
-			if c := sub.Conn(); c != nil {
-				_ = c.Flush()
+			// Readiness barrier on every endpoint: the SUB must be processed by
+			// each server before the first measured publish, otherwise a slow
+			// endpoint's setup shows up as delivery loss.
+			for i, l := range sub.links {
+				c := l.Conn()
+				if c == nil {
+					b.Fatalf("endpoint %d: no connection after WaitConnected", i)
+				}
+				if err := c.FlushTimeout(5 * time.Second); err != nil {
+					b.Fatalf("endpoint %d: flush subscription: %v", i, err)
+				}
 			}
 			mp, err := NewMirroredPublisherPool(urls, members, PublisherOptions{
 				Options: Options{Topic: topic, ReportInterval: -1, Logger: benchLogger{}},
@@ -146,29 +155,41 @@ func BenchmarkMirrorEndToEnd(b *testing.B) {
 }
 
 // BenchmarkMirrorPublishRejected measures a publish that every endpoint queue
-// rejects (both byte budgets exhausted): no server, no consumer. The point is
-// the allocation column: shedding load must not copy the payload.
+// rejects, with the queues full either by bytes or by entries: no server, no
+// consumer. The point is the allocation column: shedding load must not copy
+// the payload in either case.
 func BenchmarkMirrorPublishRejected(b *testing.B) {
-	for _, size := range []int{64, 4 << 10, 2 << 20} {
-		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
-			p, err := NewMirroredPublisher([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, PublisherOptions{
-				Options: Options{Topic: "t", ReportInterval: -1, Logger: benchLogger{}},
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
-			p.running.Store(true) // never started: no connections, no send goroutines
-			for _, g := range p.groups {
-				g.queuedBytes.Store(g.maxBytes)
-			}
-			payload := make([]byte, size)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if err := p.Publish(payload); !errors.Is(err, ErrQueueFull) {
+	for _, full := range []string{"bytes", "entries"} {
+		for _, size := range []int{64, 4 << 10, 2 << 20} {
+			b.Run(fmt.Sprintf("%s/%dB", full, size), func(b *testing.B) {
+				p, err := NewMirroredPublisher([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, PublisherOptions{
+					Options: Options{Topic: "t", ReportInterval: -1, Logger: benchLogger{}},
+				})
+				if err != nil {
 					b.Fatal(err)
 				}
-			}
-		})
+				p.running.Store(true) // never started: no connections, no send goroutines
+				switch full {
+				case "bytes":
+					for _, g := range p.groups {
+						g.queuedBytes.Store(g.maxBytes)
+					}
+				case "entries":
+					for i := 0; i < mirrorQueueEntries; i++ {
+						if err := p.Publish([]byte("small")); err != nil {
+							b.Fatal(err)
+						}
+					}
+				}
+				payload := make([]byte, size)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := p.Publish(payload); !errors.Is(err, ErrQueueFull) {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
 	}
 }

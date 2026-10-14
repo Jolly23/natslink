@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -50,6 +51,62 @@ func TestMirroredPublishRejectionDoesNotCopy(t *testing.T) {
 	}
 	if got := p.groups[0].queuedBytes.Load(); got != 0 {
 		t.Errorf("oversized rejection left %d reserved bytes", got)
+	}
+}
+
+// Queues full by entries (not bytes) reject without copying as well, and the
+// entry reservation never overcommits under concurrent producers.
+func TestMirroredPublishEntryFullRejectionDoesNotCopy(t *testing.T) {
+	p, _, _ := newTwoEndpointPool(t)
+	p.running.Store(true) // never started: nothing drains, so the queues fill by entries
+	for i := 0; i < mirrorQueueEntries; i++ {
+		if err := p.Publish([]byte("small")); err != nil {
+			t.Fatalf("fill publish %d: %v", i, err)
+		}
+	}
+	for i, g := range p.groups {
+		if n := g.queuedEntries.Load(); n != mirrorQueueEntries || len(g.queue) != mirrorQueueEntries {
+			t.Fatalf("endpoint %d entries=%d len=%d, want %d", i, n, len(g.queue), mirrorQueueEntries)
+		}
+	}
+	big := make([]byte, 2<<20)
+	allocs := testing.AllocsPerRun(20, func() {
+		if err := p.Publish(big); !errors.Is(err, ErrQueueFull) {
+			t.Fatalf("publish into entry-full queues = %v, want ErrQueueFull", err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("entry-full rejection allocated %.1f objects per call, want 0", allocs)
+	}
+	if got := p.groups[0].queuedBytes.Load(); got != int64(mirrorQueueEntries*len("small")) {
+		t.Errorf("rejection leaked a byte reservation: queued bytes %d", got)
+	}
+
+	// Concurrent producers against drained-by-nobody queues: the number of
+	// admitted messages never exceeds the entry cap, reservations balance.
+	q, _, _ := newTwoEndpointPool(t)
+	q.running.Store(true)
+	var wg sync.WaitGroup
+	var admitted atomic.Int64
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < mirrorQueueEntries; i++ {
+				if err := q.Publish([]byte("x")); err == nil {
+					admitted.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for i, g := range q.groups {
+		if len(g.queue) != mirrorQueueEntries || g.queuedEntries.Load() != mirrorQueueEntries || g.queuedBytes.Load() != mirrorQueueEntries {
+			t.Errorf("endpoint %d after concurrent fill: len=%d entries=%d bytes=%d, want %d each", i, len(g.queue), g.queuedEntries.Load(), g.queuedBytes.Load(), mirrorQueueEntries)
+		}
+	}
+	if admitted.Load() != mirrorQueueEntries {
+		t.Errorf("admitted %d publishes, want exactly %d (both endpoints fill in lockstep)", admitted.Load(), mirrorQueueEntries)
 	}
 }
 
