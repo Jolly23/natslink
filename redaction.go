@@ -112,7 +112,13 @@ func (rs *redaction) scrub(message string) string {
 			message = strings.ReplaceAll(message, q, rs.redacted)
 		}
 	}
-	message = errorURLPattern.ReplaceAllStringFunc(message, redactURL)
+	// Every URL the pattern can match contains the scheme separator, so a
+	// message without it (the common nats.go sentinels on the failure path)
+	// skips the regexp pass and its copy; the credential-fragment pass below
+	// still runs unconditionally.
+	if strings.Contains(message, "://") {
+		message = errorURLPattern.ReplaceAllStringFunc(message, redactURL)
+	}
 	for _, secret := range rs.secrets {
 		message = strings.ReplaceAll(message, secret, "***")
 	}

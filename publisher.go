@@ -574,8 +574,12 @@ func (g *pubGroup) publish(data []byte) error {
 	start := g.cursor.Add(1)
 	lastErr := error(ErrNoConn)
 
-	// First pass: healthy first. Disconnected members are skipped and kept as fallback.
-	var fallback []*Publisher
+	// First pass: healthy first. Disconnected members are skipped and kept as
+	// fallback. The candidate list lives on the stack for common pool sizes
+	// (a scratch size, not a limit: append spills to the heap beyond it), so a
+	// degraded window does not add an allocation to every publish.
+	var fallbackBuf [8]*Publisher
+	fallback := fallbackBuf[:0]
 	for i := uint64(0); i < uint64(len(g.pubs)); i++ {
 		pub := g.pubs[(start+i)%uint64(len(g.pubs))]
 		if !pub.IsConnected() {
