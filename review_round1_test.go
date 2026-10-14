@@ -82,19 +82,31 @@ func TestMirroredPublishEntryFullRejectionDoesNotCopy(t *testing.T) {
 		t.Errorf("rejection leaked a byte reservation: queued bytes %d", got)
 	}
 
-	// Concurrent producers against drained-by-nobody queues: the number of
-	// admitted messages never exceeds the entry cap, reservations balance.
+	// Concurrent producers against drained-by-nobody queues: every endpoint
+	// ends exactly at its entry cap with balanced reservations. Publish
+	// succeeds when any endpoint admits, and the two endpoints do not fill in
+	// lockstep (one caller can take endpoint 0's last slot while another takes
+	// endpoint 1's), so the accepted count is bounded, not exact: at least one
+	// endpoint's capacity, at most one slot per accepted message across both.
+	// Every attempt is either accepted or rejected with ErrQueueFull, and a
+	// rejection is exactly one pool-level drop.
 	q, _, _ := newTwoEndpointPool(t)
 	q.running.Store(true)
+	const producers = 8
 	var wg sync.WaitGroup
-	var admitted atomic.Int64
-	for w := 0; w < 8; w++ {
+	var admitted, rejected atomic.Int64
+	for w := 0; w < producers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < mirrorQueueEntries; i++ {
-				if err := q.Publish([]byte("x")); err == nil {
+				switch err := q.Publish([]byte("x")); {
+				case err == nil:
 					admitted.Add(1)
+				case errors.Is(err, ErrQueueFull):
+					rejected.Add(1)
+				default:
+					t.Errorf("unexpected publish error: %v", err)
 				}
 			}
 		}()
@@ -105,8 +117,14 @@ func TestMirroredPublishEntryFullRejectionDoesNotCopy(t *testing.T) {
 			t.Errorf("endpoint %d after concurrent fill: len=%d entries=%d bytes=%d, want %d each", i, len(g.queue), g.queuedEntries.Load(), g.queuedBytes.Load(), mirrorQueueEntries)
 		}
 	}
-	if admitted.Load() != mirrorQueueEntries {
-		t.Errorf("admitted %d publishes, want exactly %d (both endpoints fill in lockstep)", admitted.Load(), mirrorQueueEntries)
+	if a := admitted.Load(); a < mirrorQueueEntries || a > 2*mirrorQueueEntries {
+		t.Errorf("admitted %d publishes, want between %d (one endpoint's capacity) and %d (one slot per accepted message)", a, mirrorQueueEntries, 2*mirrorQueueEntries)
+	}
+	if admitted.Load()+rejected.Load() != producers*mirrorQueueEntries {
+		t.Errorf("admitted %d + rejected %d != %d attempts", admitted.Load(), rejected.Load(), producers*mirrorQueueEntries)
+	}
+	if q.Dropped() != uint64(rejected.Load()) {
+		t.Errorf("pool dropped = %d, want %d (one per all-endpoint rejection)", q.Dropped(), rejected.Load())
 	}
 }
 
