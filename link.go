@@ -376,6 +376,46 @@ func (l *link) rebuild() {
 	}
 }
 
+// startAll starts every item with at most maxConcurrentDials attempts in
+// flight, waits for all of them (an attempt that is still dialling when
+// another fails is not abandoned), and on any failure stops every item that
+// succeeded, late finishers included, before returning the first error. Items
+// that returned an error have already cleaned up after themselves.
+func startAll[T any](items []T, start func(T) error, stop func(T)) error {
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, maxConcurrentDials)
+		mu      sync.Mutex
+		first   error
+		started []T
+	)
+	for _, it := range items {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(it T) {
+			defer func() { <-sem; wg.Done() }()
+			err := start(it)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				return
+			}
+			started = append(started, it)
+		}(it)
+	}
+	wg.Wait()
+	if first == nil {
+		return nil
+	}
+	for _, it := range started {
+		stop(it)
+	}
+	return first
+}
+
 // isSubscriptionRejection reports whether an async error is the server
 // rejecting a subscription on this connection: a permissions violation on
 // subscribe (nats.go formats it with the server's text, which names the

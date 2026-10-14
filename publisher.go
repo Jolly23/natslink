@@ -153,6 +153,7 @@ type PublisherPool struct {
 	async   bool
 	running atomic.Bool
 	stopped atomic.Bool
+	started atomic.Bool // Start is single-shot at the pool level (a second Start must not roll back the first one's members)
 	// stopMu orders Publish against Stop in a mirrored pool: Publish checks
 	// stopped and enqueues under the read lock, Stop flips stopped under the
 	// write lock before telling the send goroutines to exit, so no message can
@@ -354,17 +355,24 @@ func NewPublisherPool(n int, o PublisherOptions) (*PublisherPool, error) {
 
 // Start starts every connection in the pool; if any fails (configuration
 // error) the ones already started are stopped and that error is returned.
+//
+// Members are dialled with bounded concurrency (maxConcurrentDials): a slow
+// handshake on one endpoint's members no longer postpones the dial of an
+// independent endpoint by their count times the dial timeout.
 func (p *PublisherPool) Start() error {
 	if p.stopped.Load() {
 		return ErrStopped
 	}
-	for i, pub := range p.pubs {
-		if err := pub.Start(); err != nil {
-			for _, started := range p.pubs[:i] {
-				started.Stop()
-			}
-			return err
-		}
+	if p.started.Swap(true) {
+		return ErrAlreadyStarted
+	}
+	if err := startAll(p.pubs, (*Publisher).Start, (*Publisher).Stop); err != nil {
+		return err
+	}
+	if p.stopped.Load() {
+		// Stop ran while the members were dialling: they have discarded their
+		// connections (link.start checks stopped), nothing else to start.
+		return ErrStopped
 	}
 	if p.async {
 		for _, g := range p.groups {

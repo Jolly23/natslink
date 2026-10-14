@@ -214,6 +214,15 @@ const (
 	// deterministic shutdown matters more than a graceful goodbye.
 	stopGrace = 5 * time.Second
 
+	// maxConcurrentDials bounds how many of an instance's connections are
+	// dialled at the same time by Start (a mirrored subscriber's endpoints, a
+	// pool's members). Starting them one after another made every later
+	// endpoint wait behind each earlier member's dial timeout (a 5s stall on
+	// one tree delayed a healthy one by members x 5s); starting all of them
+	// at once would turn a large pool into a dial storm against a server that
+	// is just coming back. Eight keeps startup bounded by the slowest batch.
+	maxConcurrentDials = 8
+
 	defaultReportInterval = time.Minute
 	defaultWorkers        = 8
 	defaultQueueSize      = 4096
