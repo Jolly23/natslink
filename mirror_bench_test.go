@@ -1,9 +1,9 @@
 package natslink
 
-// Mirrored-publish cost benchmark. It only runs on the post-refactor package (it
-// depends on the mirror constructors), which is why it is kept out of
-// perf_bench_test.go, the file that can also be run against the old version. Needs
-// two local NATS servers (4222/4223) and skips when either is unreachable.
+// Mirrored-publish cost benchmark: since v1.8.0 this measures the caller's
+// side only (one payload copy plus one non-blocking enqueue per endpoint); the
+// sends happen on the endpoint goroutines. Needs two local NATS servers
+// (4222/4223) and skips when either is unreachable.
 
 import "testing"
 

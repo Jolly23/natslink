@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-14
+
+### Added
+- `DedupSet` (`NewDedupSet(entries, window)`) and `SubscriberOptions.Dedup` /
+  `DedupKey`: opt-in, allocation-free deduplication of byte-identical payloads
+  at the delivery entry point (after `Gate`, before the queue). A general
+  byte-level filter for any subscriber: one set per subscriber, one shared by
+  several (identical payloads on different subjects then collapse too), one
+  for a whole process, or `Seen` called directly on any path; the typical case
+  is a mirrored subscription delivering each message once (first copy wins).
+  FIFO set of 64-bit `hash/maphash` values with an optional age bound. New
+  `Stats.Deduped` counter and `deduped=` field in the status line.
+- `NewMirroredPublisher(urls, opts)`: one publishing connection per endpoint,
+  at most 5 endpoints, returned as a `*PublisherPool`.
+- `ErrQueueFull`, returned by a mirrored pool when no endpoint queue could
+  take the message.
+
+### Changed
+- Mirrored publishing is now parallel: a `PublisherPool` with two or more
+  endpoints gives each endpoint its own bounded send queue (4096 messages,
+  16 MB) and goroutine. `Publish` copies the message once, hands it to every
+  queue without blocking and returns `nil` as soon as any queue accepts; a
+  stalled endpoint backs up and, when full, drops only its own copies. Send
+  failures surface in the members' `Stats`, a backlog in their `QueueLen` /
+  `QueueCap`, and the pool-level `Dropped` (every endpoint failed) is settled
+  asynchronously. On `Stop` each send goroutine flushes its queue before
+  exiting; the send lines are waited for in parallel, bounded by one stop
+  grace in total. Single-endpoint pools keep the synchronous `Publish`.
+- Every mirrored constructor given a single URL degrades to its plain
+  counterpart: `NewMirroredPublisher` → `NewPublisherPool(1, opts)`,
+  `NewMirroredPublisherPool` → `NewPublisherPool(n, opts)`,
+  `NewMirroredSubscriber` → `NewSubscriber` (plain naming, no `-e0`).
+- README: mirroring no longer says deduplication always belongs to the
+  consumer; byte-identical copies can be collapsed in the library, content-level
+  deduplication still cannot.
+
+## [1.7.0] - 2026-10-14 [YANKED]
+
+Tagged and withdrawn the same day; its content ships in 1.8.0 together with
+the parallel mirrored publisher. Do not depend on this version.
+
 ## [1.6.1] - 2026-10-07
 
 No library code change; CI and release-process maintenance.
@@ -132,6 +173,8 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/Jolly23/natslink/compare/v1.7.0...v1.8.0
+[1.7.0]: https://github.com/Jolly23/natslink/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/Jolly23/natslink/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/Jolly23/natslink/releases/tag/v1.6.0
