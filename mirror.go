@@ -51,6 +51,10 @@ import (
 // misconfiguring something (a cluster's members instead of independent trees).
 const maxMirroredPublisherEndpoints = 5
 
+// maxMirroredPoolEndpoints bounds NewMirroredPublisherPool, whose per-endpoint
+// admission bookkeeping is a 64-bit mask.
+const maxMirroredPoolEndpoints = 64
+
 // NewMirroredPublisher creates one publishing connection per endpoint, at most
 // maxMirroredPublisherEndpoints (5) endpoints, and returns them as a
 // *PublisherPool whose Publish sends once per endpoint and returns nil as soon
@@ -106,6 +110,9 @@ func NewMirroredPublisherPool(urls []string, n int, o PublisherOptions) (*Publis
 	if len(urls) == 1 {
 		o.Options.URL = urls[0]
 		return NewPublisherPool(n, o)
+	}
+	if len(urls) > maxMirroredPoolEndpoints {
+		return nil, fmt.Errorf("natslink: mirrored publisher pool allows at most %d endpoints, got %d", maxMirroredPoolEndpoints, len(urls))
 	}
 
 	base := o.Options.Name

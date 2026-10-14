@@ -228,19 +228,25 @@ func (p *PublisherPool) enableAsync() {
 	}
 }
 
-// enqueue hands m to this endpoint's send goroutine without blocking; false
-// means the queue is full by entries or bytes and this endpoint's copy is dropped.
-func (g *pubGroup) enqueue(m *mirrorMsg) bool {
-	n := int64(len(m.data))
+// reserve claims n bytes of this endpoint's queue budget without blocking;
+// false means the byte bound would be exceeded and nothing was claimed.
+func (g *pubGroup) reserve(n int64) bool {
 	if g.queuedBytes.Add(n) > g.maxBytes {
 		g.queuedBytes.Add(-n)
 		return false
 	}
+	return true
+}
+
+// enqueue hands m to this endpoint's send goroutine without blocking, with its
+// bytes already reserved; false means the queue is full by entries, and the
+// reservation has been released.
+func (g *pubGroup) enqueue(m *mirrorMsg) bool {
 	select {
 	case g.queue <- m:
 		return true
 	default:
-		g.queuedBytes.Add(-n)
+		g.queuedBytes.Add(-int64(len(m.data)))
 		return false
 	}
 }
@@ -498,16 +504,34 @@ func (p *PublisherPool) publishAsync(data []byte) error {
 		p.dropped.Add(1)
 		return ErrNotRunning
 	}
+	// Reserve queue bytes on every endpoint first and copy the payload only if
+	// at least one endpoint can take it: under overload (or for a payload
+	// larger than the byte bound) a rejection must cost nothing proportional to
+	// the payload, otherwise shedding load is what fills the heap.
+	n := int64(len(data))
+	var reserved uint64 // bit i = endpoint i holds a reservation (endpoints are capped at 64)
+	for i, g := range p.groups {
+		if g.reserve(n) {
+			reserved |= 1 << i
+		}
+	}
+	if reserved == 0 {
+		for _, g := range p.groups {
+			g.dropped.Add(1)
+		}
+		p.dropped.Add(1)
+		return ErrQueueFull
+	}
 	m := &mirrorMsg{data: bytes.Clone(data)}
 	m.remaining.Store(int32(len(p.groups)))
 	accepted := 0
-	for _, g := range p.groups {
-		if g.enqueue(m) {
+	for i, g := range p.groups {
+		if reserved&(1<<i) != 0 && g.enqueue(m) {
 			accepted++
-		} else {
-			g.dropped.Add(1)
-			m.settle(p, true)
+			continue
 		}
+		g.dropped.Add(1)
+		m.settle(p, true)
 	}
 	if accepted == 0 {
 		return ErrQueueFull

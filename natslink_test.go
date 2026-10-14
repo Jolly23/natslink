@@ -256,7 +256,7 @@ func TestSubscriberGate(t *testing.T) {
 func TestValidateTopic(t *testing.T) {
 	for _, tc := range []struct{ topic, role string }{
 		{"events.tx", "pub"}, {"events.tx", "sub"}, {"single", "pub"},
-		{"a.*.c", "sub"}, {"a.>", "sub"}, // wildcard subscriptions are legal
+		{"a.*.c", "sub"}, {"a.>", "sub"}, {"*", "sub"}, {">", "sub"}, // wildcard subscriptions are legal
 	} {
 		if err := validateTopic(tc.topic, tc.role); err != nil {
 			t.Errorf("validateTopic(%q, %s) = %v, want nil", tc.topic, tc.role, err)
@@ -267,6 +267,7 @@ func TestValidateTopic(t *testing.T) {
 		{".events.tx", "sub"}, {"events..tx", "pub"}, {"events.tx.", "sub"}, // empty token
 		{"events. tx", "pub"}, {"events.tx\n", "sub"}, // whitespace
 		{"a.*.c", "pub"}, {"a.>", "pub"}, // wildcard publishing is illegal
+		{"audit.>.tail", "sub"}, {">.tail", "sub"}, {"audit.>.>", "sub"}, // > must be the last token
 	} {
 		if err := validateTopic(tc.topic, tc.role); err == nil {
 			t.Errorf("validateTopic(%q, %s) = nil, want error", tc.topic, tc.role)

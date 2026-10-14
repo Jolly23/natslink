@@ -284,7 +284,8 @@ func validateTopic(topic, role string) error {
 	if topic == "" {
 		return errors.New("natslink: Options.Topic is required")
 	}
-	for _, tok := range strings.Split(topic, ".") {
+	toks := strings.Split(topic, ".")
+	for i, tok := range toks {
 		switch {
 		case tok == "":
 			return fmt.Errorf("natslink: invalid topic %q: empty token (leading/trailing/double dot)", topic)
@@ -292,6 +293,11 @@ func validateTopic(topic, role string) error {
 			return fmt.Errorf("natslink: invalid topic %q: whitespace in token", topic)
 		case role == "pub" && (tok == "*" || tok == ">"):
 			return fmt.Errorf("natslink: invalid topic %q: wildcard is subscribe-only, cannot publish to it", topic)
+		case tok == ">" && i != len(toks)-1:
+			// The server rejects a SUB with a non-terminal ">" (-ERR Invalid
+			// Subject) and closes the connection; nats.go does not check it
+			// locally, so without this the subscriber would rebuild forever.
+			return fmt.Errorf("natslink: invalid topic %q: the > wildcard must be the last token", topic)
 		}
 	}
 	return nil

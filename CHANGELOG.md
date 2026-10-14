@@ -22,6 +22,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   at most 5 endpoints, returned as a `*PublisherPool`.
 - `ErrQueueFull`, returned by a mirrored pool when no endpoint queue could
   take the message.
+- Benchmarks: `BenchmarkMirrorEndToEnd` (lossless, barrier-paced delivery
+  through a mirrored subscriber on two servers) and
+  `BenchmarkMirrorPublishRejected` (overload rejection cost);
+  `BenchmarkHotMirrorPublish` reports `rejected/op` instead of failing under
+  expected overload, `BenchmarkHotSubscriberDispatch` times completed handler
+  work and reports `dropped/op`.
 
 ### Changed
 - Mirrored publishing is now parallel: a `PublisherPool` with two or more
@@ -42,6 +48,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   counterpart: `NewMirroredPublisher` → `NewPublisherPool(1, opts)`,
   `NewMirroredPublisherPool` → `NewPublisherPool(n, opts)`,
   `NewMirroredSubscriber` → `NewSubscriber` (plain naming, no `-e0`).
+- A mirrored publish that no endpoint can admit (every byte budget exhausted,
+  or a payload over the 16 MB bound) is rejected before the payload is copied:
+  queue bytes are reserved per endpoint first and the copy is made only when
+  at least one endpoint has room, so shedding load costs nothing proportional
+  to the payload (about 12 ns and no allocation regardless of size).
+  `NewMirroredPublisherPool` accepts at most 64 endpoints.
+- `Stats()` on a subscriber no longer holds the subscription lock while
+  asking each connection whether it is closed, so a scrape stalled on one
+  endpoint's connection lock cannot block another endpoint's rebuild setup;
+  the merged snapshot also computes the shared state once instead of once per
+  endpoint.
+- A subscription subject with a non-terminal `>` token (`a.>.b`) is rejected
+  at construction instead of being accepted locally and then rejected by the
+  server on every rebuild.
 - README: mirroring no longer says deduplication always belongs to the
   consumer; byte-identical copies can be collapsed in the library, content-level
   deduplication still cannot.

@@ -276,7 +276,9 @@ the first one is delivered again. Hashing cost is the only per-message cost:
 about 50 ns for 64 B, 0.3 µs for 4 KB and 130 µs for 2 MB on one core.
 
 Subjects pass straight through to NATS, so subscriptions may use wildcards
-(`*` / `>`); one connection still binds exactly one subject expression. Client
+(`*` / `>`, with `>` only as the last token; a misplaced `>` is rejected at
+construction because the server would reject the subscription on every
+reconnect); one connection still binds exactly one subject expression. Client
 buffer limits (`PendingMsgLimit` / `PendingBytesLimit`) are documented on
 `SubscriberOptions` and rarely need changing in worker-pool mode.
 
@@ -454,7 +456,10 @@ Semantics at a glance:
   endpoint failing just means one fewer path, not a loss. Only when **no**
   endpoint queue can take the message is `ErrQueueFull` returned, and only a
   message that every endpoint failed to send counts in the pool-level
-  `Dropped()` (settled asynchronously). Send failures on one endpoint show up
+  `Dropped()` (settled asynchronously). Admission reserves queue bytes per
+  endpoint before copying the payload, so a publish that nothing can admit is
+  rejected for a few nanoseconds without copying anything. Send failures on
+  one endpoint show up
   in that member's `Stats.Dropped`, a backlog in its `QueueLen`, and copies
   its queue discarded (full, or left over when `Stop` gave up on a stalled
   send) in its `QueueDropped` (`queue_dropped=` in the status line). `Stop`

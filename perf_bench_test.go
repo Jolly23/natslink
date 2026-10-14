@@ -13,6 +13,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -117,11 +118,14 @@ func BenchmarkHotSubscriberDispatch(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		s.dispatch(msg)
 	}
-	b.StopTimer()
-	// Wait for the workers to drain so the measurement covers full consumption,
-	// not just enqueue-and-discard.
+	// The drain is inside the timed interval so the figure is completed
+	// handler work; drops (queue full under this unthrottled producer) are
+	// reported separately rather than counted as consumption.
 	for int(consumed.Load())+int(s.Stats().Dropped) < b.N {
+		time.Sleep(10 * time.Microsecond)
 	}
+	b.StopTimer()
+	b.ReportMetric(float64(s.Stats().Dropped)/float64(b.N), "dropped/op")
 }
 
 // Sync-mode dispatch: the lowest-latency path (no queue hand-off).

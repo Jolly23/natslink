@@ -5,8 +5,22 @@ package natslink
 // sends happen on the endpoint goroutines. Needs two local NATS servers
 // (4222/4223) and skips when either is unreachable.
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
 
+	"github.com/nats-io/nats.go"
+)
+
+// BenchmarkHotMirrorPublish measures the caller's side of a mirrored publish
+// only: one reservation per endpoint, one payload copy, one non-blocking
+// enqueue per endpoint. The producer runs faster than the send goroutines, so
+// queues fill and some calls return ErrQueueFull; that is the expected
+// overload behaviour, reported as the "rejected/op" metric rather than failing
+// the benchmark. Setup, Stop and draining are outside the timer.
 func BenchmarkHotMirrorPublish(b *testing.B) {
 	for _, u := range []string{benchURL(), dualURL2()} {
 		if err := Probe(u); err != nil {
@@ -20,16 +34,141 @@ func BenchmarkHotMirrorPublish(b *testing.B) {
 		b.Fatal(err)
 	}
 	mp.MustStart()
-	defer mp.Stop()
-	if err := mp.WaitConnected(5000000000); err != nil {
+	if err := mp.WaitConnected(5 * time.Second); err != nil {
 		b.Fatal(err)
 	}
 
+	var rejected int
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := mp.Publish(benchPayload); err != nil {
+		switch err := mp.Publish(benchPayload); {
+		case err == nil:
+		case errors.Is(err, ErrQueueFull):
+			rejected++
+		default:
 			b.Fatal(err)
 		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(rejected)/float64(b.N), "rejected/op")
+	mp.Stop()
+}
+
+// BenchmarkMirrorEndToEnd measures sustainable delivery through a mirrored
+// publisher to a mirrored subscriber on two healthy servers: bounded batches
+// of accepted messages with a completion barrier (every accepted message
+// received on every endpoint) inside the timed interval, so the number is
+// completed work, not enqueue attempts. Offered load is throttled by the
+// barrier: a batch is published, then the benchmark waits for all of its
+// copies before the next batch. Loss within a batch fails the benchmark, so
+// the figure is labelled lossless.
+func BenchmarkMirrorEndToEnd(b *testing.B) {
+	urls := []string{benchURL(), dualURL2()}
+	for _, u := range urls {
+		if err := Probe(u); err != nil {
+			b.Skipf("NATS not reachable: %v", err)
+		}
+	}
+	for _, members := range []int{1, 4} {
+		b.Run(fmt.Sprintf("members=%d", members), func(b *testing.B) {
+			topic := fmt.Sprintf("natslink.bench.e2e.%d", time.Now().UnixNano())
+			var received atomic.Int64
+			sub, err := NewMirroredSubscriber(urls, SubscriberOptions{
+				Options: Options{Topic: topic, ReportInterval: -1, Logger: benchLogger{}},
+				Handler: func(*nats.Msg) { received.Add(1) },
+				Workers: SyncMode,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			sub.MustStart()
+			defer sub.Stop()
+			if err := sub.WaitConnected(5 * time.Second); err != nil {
+				b.Fatal(err)
+			}
+			if c := sub.Conn(); c != nil {
+				_ = c.Flush()
+			}
+			mp, err := NewMirroredPublisherPool(urls, members, PublisherOptions{
+				Options: Options{Topic: topic, ReportInterval: -1, Logger: benchLogger{}},
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			mp.MustStart()
+			defer mp.Stop()
+			if err := mp.WaitConnected(5 * time.Second); err != nil {
+				b.Fatal(err)
+			}
+
+			const batch = 1024
+			var accepted, rejected int64
+			wait := func(want int64) {
+				deadline := time.Now().Add(10 * time.Second)
+				for received.Load() < want {
+					if time.Now().After(deadline) {
+						b.Fatalf("lossless barrier: received %d copies, want %d", received.Load(), want)
+					}
+					time.Sleep(50 * time.Microsecond)
+				}
+			}
+			b.SetBytes(int64(len(benchPayload)))
+			b.ResetTimer()
+			for sent := 0; sent < b.N; {
+				n := batch
+				if rest := b.N - sent; rest < n {
+					n = rest
+				}
+				for i := 0; i < n; i++ {
+					switch err := mp.Publish(benchPayload); {
+					case err == nil:
+						accepted++
+					case errors.Is(err, ErrQueueFull):
+						rejected++
+					default:
+						b.Fatal(err)
+					}
+				}
+				wait(accepted * int64(len(urls)))
+				sent += n
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(accepted)/float64(b.N), "accepted/op")
+			b.ReportMetric(float64(rejected)/float64(b.N), "rejected/op")
+			for i, st := range mp.Stats() {
+				if st.QueueDropped != 0 {
+					b.Fatalf("member %d queue-dropped %d copies in a lossless measurement", i, st.QueueDropped)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkMirrorPublishRejected measures a publish that every endpoint queue
+// rejects (both byte budgets exhausted): no server, no consumer. The point is
+// the allocation column: shedding load must not copy the payload.
+func BenchmarkMirrorPublishRejected(b *testing.B) {
+	for _, size := range []int{64, 4 << 10, 2 << 20} {
+		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			p, err := NewMirroredPublisher([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, PublisherOptions{
+				Options: Options{Topic: "t", ReportInterval: -1, Logger: benchLogger{}},
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			p.running.Store(true) // never started: no connections, no send goroutines
+			for _, g := range p.groups {
+				g.queuedBytes.Store(g.maxBytes)
+			}
+			payload := make([]byte, size)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := p.Publish(payload); !errors.Is(err, ErrQueueFull) {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

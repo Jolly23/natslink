@@ -408,6 +408,9 @@ func (s *Subscriber) Conn() *nats.Conn {
 func (s *Subscriber) Stats() Stats {
 	paused, diverged := s.subState()
 	out := Stats{Status: "no-conn", Dropped: s.dropped.Load(), Gated: s.gated.Load(), Deduped: s.deduped.Load(), Paused: paused, Pauses: s.pauses.Load(), Diverged: diverged}
+	// Only the connection-level fields of each link are read below (rawStats):
+	// the shared fields were computed once above, and running subState once per
+	// link through the stats hook would scan the endpoints N extra times.
 	if len(s.links) > 0 {
 		out.Name = s.links[0].o.Name
 	}
@@ -416,7 +419,7 @@ func (s *Subscriber) Stats() Stats {
 	}
 	allConnected := len(s.links) > 0
 	for _, l := range s.links {
-		st := l.Stats()
+		st := l.rawStats()
 		if st.Connected {
 			if !out.Connected {
 				out.Connected = true
@@ -748,19 +751,33 @@ func (s *Subscriber) heal() {
 // subState reads the paused state and the unaligned endpoint count in one subMu
 // critical section (the Stats.Diverged definition, see reconcileLocked: only
 // endpoints with a live connection count; endpoints inside a rebuild window do not).
+//
+// Only the subscriber's own state is read under subMu; the per-connection
+// IsClosed check happens after the lock is released, because it takes the
+// nats.go connection lock, which a stalled write or a reconnect handshake on
+// that endpoint can hold for seconds. Holding subMu across it would let a
+// Stats scrape on one stalled endpoint block another endpoint's rebuild setup.
 func (s *Subscriber) subState() (paused bool, diverged int) {
+	type candidate struct {
+		conn      *nats.Conn
+		unaligned bool
+	}
 	s.subMu.Lock()
-	defer s.subMu.Unlock()
+	paused = s.paused
+	cands := make([]candidate, 0, len(s.links))
 	for _, l := range s.links {
-		conn := s.conns[l]
-		if conn == nil || conn.IsClosed() {
-			continue
+		if conn := s.conns[l]; conn != nil {
+			_, subscribed := s.subs[l]
+			cands = append(cands, candidate{conn: conn, unaligned: subscribed == paused})
 		}
-		if _, ok := s.subs[l]; ok == s.paused {
+	}
+	s.subMu.Unlock()
+	for _, c := range cands {
+		if c.unaligned && !c.conn.IsClosed() {
 			diverged++
 		}
 	}
-	return s.paused, diverged
+	return paused, diverged
 }
 
 // IsPaused reports whether the subscription is currently paused (between Pause and Resume).
