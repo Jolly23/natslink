@@ -358,6 +358,15 @@ func discard(conn *nats.Conn) {
 // Stats returns a snapshot of the current status and data statistics. It is
 // safe to call concurrently at any time.
 func (l *link) Stats() Stats {
+	s := l.rawStats()
+	if l.statsHook != nil {
+		l.statsHook(&s)
+	}
+	return s
+}
+
+// rawStats is Stats without the owner's hook: the connection-level fields only.
+func (l *link) rawStats() Stats {
 	s := Stats{
 		Name:          l.o.Name,
 		Running:       l.running.Load(),
@@ -382,9 +391,6 @@ func (l *link) Stats() Stats {
 		s.OutMsgs += st.OutMsgs
 		s.InBytes += st.InBytes
 		s.OutBytes += st.OutBytes
-	}
-	if l.statsHook != nil {
-		l.statsHook(&s)
 	}
 	return s
 }

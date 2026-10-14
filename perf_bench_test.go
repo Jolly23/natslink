@@ -13,6 +13,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -93,8 +94,10 @@ func BenchmarkHotPoolPublish(b *testing.B) {
 }
 
 // Subscriber dispatch hot path (worker-pool mode): dispatch enqueue + worker
-// consumption. Pure in-memory, no server needed; before and after the refactor this
-// should be instruction-for-instruction identical, which is what this verifies.
+// consumption. Pure in-memory, no server needed. ns/op is the admission cost
+// per dispatch attempt (drops included); completed handler throughput is the
+// separate "consumed/s" metric, and dropped/op says how much of the offered
+// load the unthrottled producer pushed past the queue.
 func BenchmarkHotSubscriberDispatch(b *testing.B) {
 	var consumed atomic.Uint64
 	s, err := NewSubscriber(SubscriberOptions{
@@ -113,15 +116,21 @@ func BenchmarkHotSubscriberDispatch(b *testing.B) {
 
 	msg := &nats.Msg{Data: benchPayload}
 	b.ReportAllocs()
+	start := time.Now()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		s.dispatch(msg)
 	}
-	b.StopTimer()
-	// Wait for the workers to drain so the measurement covers full consumption,
-	// not just enqueue-and-discard.
+	// The drain is inside the timed interval so consumed/s is completed
+	// handler work; drops (queue full under this unthrottled producer) are
+	// reported separately rather than counted as consumption.
 	for int(consumed.Load())+int(s.Stats().Dropped) < b.N {
+		time.Sleep(10 * time.Microsecond)
 	}
+	b.StopTimer()
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(s.Stats().Dropped)/float64(b.N), "dropped/op")
+	b.ReportMetric(float64(consumed.Load())/elapsed.Seconds(), "consumed/s")
 }
 
 // Sync-mode dispatch: the lowest-latency path (no queue hand-off).
