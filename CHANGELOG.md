@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-10-15
+
+### Changed
+- Test only: `TestMirroredPublishQueueFullAccounting` waits for the send
+  lines' slot reservations instead of the channel length, which could still
+  be taken a moment after a message left the channel (one flaky release run).
+
 ## [1.8.2] - 2026-10-15
 
 ### Fixed
@@ -249,7 +256,8 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.2...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.3...HEAD
+[1.8.3]: https://github.com/Jolly23/natslink/compare/v1.8.2...v1.8.3
 [1.8.2]: https://github.com/Jolly23/natslink/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/Jolly23/natslink/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/Jolly23/natslink/compare/v1.7.0...v1.8.0
