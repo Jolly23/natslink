@@ -2,6 +2,7 @@ package natslink
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -311,26 +312,72 @@ func TestIntegrationWorkersActiveBeforeAllEndpointsConnect(t *testing.T) {
 	}
 }
 
-// Members are dialled concurrently: with endpoint 0's four members gated, the
-// first dial of endpoint 1 happens right away instead of after four dial
-// timeouts. No server needed; nothing has to connect.
+// Members are dialled concurrently and interleaved across endpoints: with
+// endpoint 0's members gated, the first dial of endpoint 1 happens right away
+// instead of after the slow members' dial timeouts, also when endpoint 0 has
+// as many members as the whole dial budget (8) or more. No server needed.
 func TestMirroredPoolDialsEndpointsConcurrently(t *testing.T) {
-	const slow, fast = "127.0.0.1:1", "127.0.0.1:2"
-	d := newAddressGatedDialer(slow)
-	pool, err := NewMirroredPublisherPool([]string{"nats://" + slow, "nats://" + fast}, 4, PublisherOptions{
-		Options: Options{Topic: "t", ReportInterval: -1, ExtraNatsOptions: []nats.Option{nats.SetCustomDialer(d)}},
+	for _, members := range []int{4, maxConcurrentDials, 2 * maxConcurrentDials} {
+		t.Run(fmt.Sprintf("members=%d", members), func(t *testing.T) {
+			const slow, fast = "127.0.0.1:1", "127.0.0.1:2"
+			d := newAddressGatedDialer(slow)
+			pool, err := NewMirroredPublisherPool([]string{"nats://" + slow, "nats://" + fast}, members, PublisherOptions{
+				Options: Options{Topic: "t", ReportInterval: -1, ExtraNatsOptions: []nats.Option{nats.SetCustomDialer(d)}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan error, 1)
+			start := time.Now()
+			go func() { started <- pool.Start() }()
+			t.Cleanup(func() { close(d.gate); <-started; pool.Stop() })
+			waitUntil(t, 3*time.Second, "fast endpoint dialled", func() bool { _, ok := d.firstDial(fast); return ok })
+			at, _ := d.firstDial(fast)
+			if el := at.Sub(start); el > 500*time.Millisecond {
+				t.Errorf("fast endpoint's first dial started %v after Start while slow members were gated; want immediate", el)
+			}
+		})
+	}
+}
+
+// Stop between the member dials and the send-line registration: Start must
+// not register any send line and returns ErrStopped; Publish afterwards is
+// ErrStopped too. Plus a public-API race loop (Start and Stop concurrently)
+// under the race detector, which is where a WaitGroup Add/Wait race shows.
+func TestMirroredPoolStopDuringSenderRegistration(t *testing.T) {
+	pool, err := NewMirroredPublisherPool([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, 1, PublisherOptions{
+		Options: Options{Topic: "t", ReportInterval: -1},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := make(chan error, 1)
-	start := time.Now()
-	go func() { started <- pool.Start() }()
-	t.Cleanup(func() { close(d.gate); <-started; pool.Stop() })
-	waitUntil(t, 3*time.Second, "fast endpoint dialled", func() bool { _, ok := d.firstDial(fast); return ok })
-	at, _ := d.firstDial(fast)
-	if el := at.Sub(start); el > 500*time.Millisecond {
-		t.Errorf("fast endpoint's first dial started %v after Start while slow members were gated; want immediate", el)
+	pool.testBeforeRegister = pool.Stop
+	if err := pool.Start(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("Start with Stop before registration = %v, want ErrStopped", err)
+	}
+	if pool.running.Load() {
+		t.Fatal("pool reports running after a Stop that raced registration")
+	}
+	if err := pool.Publish([]byte("x")); !errors.Is(err, ErrStopped) {
+		t.Fatalf("Publish after Stop = %v, want ErrStopped", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		p, err := NewMirroredPublisherPool([]string{"nats://127.0.0.1:1", "nats://127.0.0.1:2"}, 2, PublisherOptions{
+			Options: Options{Topic: "t", ReportInterval: -1},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = p.Start() }()
+		go func() { defer wg.Done(); p.Stop() }()
+		wg.Wait()
+		p.Stop()
+		if err := p.Publish([]byte("x")); !errors.Is(err, ErrStopped) {
+			t.Fatalf("iteration %d: Publish after Stop = %v, want ErrStopped", i, err)
+		}
 	}
 }
 

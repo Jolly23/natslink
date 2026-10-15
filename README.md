@@ -114,6 +114,13 @@ if err := pool.Publish(payload); err != nil {
 }
 ```
 
+`Start` dials an instance's connections (a mirrored subscriber's endpoints, a
+pool's members) with at most eight in flight, so startup takes the slowest
+batch rather than the sum, and a subscriber's workers are running before the
+first endpoint can deliver. `Stop` may be called at any point, including
+during that initial dial: it never leaves a connection behind, and the
+interrupted `Start` returns `ErrStopped`.
+
 The three-line startup discipline: **`MustProbe`** (environment) → **`New*`**
 (configuration) → **`MustStart`**. Note that `MustStart` succeeding does *not*
 mean the connection is up (see the failure model); the fail-fast guarantee comes
@@ -274,6 +281,18 @@ carried in the payload) stays in the application; and it is a latency and CPU
 saving, not a delivery guarantee: a copy arriving after the set has forgotten
 the first one is delivered again. Hashing cost is the only per-message cost:
 about 50 ns for 64 B, 0.3 µs for 4 KB and 130 µs for 2 MB on one core.
+
+**Server-side rejection** (v1.8.2): a SUB the server refuses (a permissions
+violation on the subject, the subscription limit) is answered with -ERR
+after the local `Subscribe` already succeeded, and nats.go never retries it.
+Every SUB is therefore verified with one flush round trip (a few ms, only on
+subscribe, resume, rebuild and retry), and a rejection is treated like a
+failed `Resume`: no handle is installed (`Stats.Diverged` goes to 1 for that
+endpoint) and the SUB is re-sent on the rebuild backoff schedule (2 s doubling
+to 30 s, seeded by the number of consecutive rejections), so an ACL fixed by
+a config reload takes effect without any action from you. A rejection the
+server reports later for an installed handle is handled the same way. Log
+line `[natslink] subscription rejected by server, retrying`.
 
 Subjects pass straight through to NATS, so subscriptions may use wildcards
 (`*` / `>`, with `>` only as the last token; a misplaced `>` is rejected at

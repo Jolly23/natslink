@@ -56,11 +56,17 @@ type link struct {
 	// onSubRejected, when set by a Subscriber, is called from the async error
 	// callback with the server's rejection of this connection's subscription
 	// (permissions violation on the subscribed subject, subscription limit).
-	// It must not block (it runs on nats.go's async-callback goroutine).
+	// It must not block (it runs on nats.go's async-callback goroutine) and is
+	// called before anything else in the callback, so the handle it fences
+	// against is the one that existed when nats.go delivered the error.
 	onSubRejected func(conn *nats.Conn, err error)
 	// testBeforeInstall, when set, runs between setup and the connection
 	// swap in start (a hook for the Stop-vs-Start race tests).
 	testBeforeInstall func()
+	// curSub mirrors the owning Subscriber's handle for this link (nil when
+	// none), readable without the Subscriber's lock: the async-error callback
+	// snapshots it to fence a delayed rejection against a replacement handle.
+	curSub atomic.Pointer[nats.Subscription]
 	// statsHook lets the owner inject shared fields into this connection's
 	// Stats snapshot (the Subscriber's queue level and overflow drop count).
 	// Without it the built-in status report (one line per connection when
@@ -156,17 +162,18 @@ func (l *link) dial() (*nats.Conn, error) {
 			}
 			// A slow consumer silently loses messages (the connection stays healthy and
 			// looks fine while dropping data); count it separately so it can be observed.
+			// A server-side rejection of the subscription (sub is nil here: the
+			// server names the subject only in the error text) is handed to the
+			// subscription supervision first, before any logging that could delay
+			// it; the connection itself stays healthy and nats.go never retries
+			// the SUB.
+			if l.onSubRejected != nil && isSubscriptionRejection(err) {
+				l.onSubRejected(c, err)
+			}
 			if errors.Is(err, nats.ErrSlowConsumer) {
 				l.slowConsumers.Add(1)
 			}
 			l.o.Logger.Warn("[natslink] ⚠️ async error", "client", l.o.Name, "topic", subject, "err", redactError(l.o.URL, err))
-			// A server-side rejection of the subscription (sub is nil here: the
-			// server names the subject only in the error text) is handed to the
-			// subscription supervision; the connection itself stays healthy and
-			// nats.go never retries the SUB.
-			if l.onSubRejected != nil && isSubscriptionRejection(err) {
-				l.onSubRejected(c, err)
-			}
 		}),
 	)
 

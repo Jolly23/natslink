@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-10-15
+
+### Fixed
+- `Stop` racing an in-flight initial dial could leave a live connection behind
+  (and `Start` returned nil): `Start` now checks the stopped flag after the
+  dial and again after installing the connection, discards the connection
+  when `Stop` won and returns `ErrStopped`; `WaitConnected` reports
+  `ErrStopped` instead of a lingering socket's readiness.
+- A subscription the server rejected (permissions violation on the subject,
+  subscription limit) stayed silently idle forever: the connection was fine,
+  the local handle looked valid, and nothing retried. Every SUB is now
+  verified with one flush round trip (the server answers a rejected SUB with
+  -ERR before the PONG, and nats.go records it on the connection before it
+  queues the async callback), so a rejection at subscribe time is detected
+  deterministically: the endpoint is left unaligned (`Stats.Diverged`) and
+  the SUB is re-sent on the rebuild backoff schedule seeded by the number of
+  consecutive rejections (2s doubling to 30s). A rejection reported later
+  through the async callback (an ACL revoked, a replayed SUB after a
+  reconnect) drops and unsubscribes the handle and retries the same way; it
+  is fenced against the handle it concerned and against a callback queue
+  that delayed it across a replacement, so a Pause/Resume-installed accepted
+  handle is never invalidated by an old error. An ACL repaired by a server
+  config reload takes effect without any caller action; a publish violation,
+  another subject (names are %q-decoded) or a stale connection is ignored.
+  New log line `[natslink] subscription rejected by server, retrying`.
+
+### Changed
+- Startup: a subscriber's workers run before any endpoint is dialled, so an
+  endpoint that connects early never fills a queue nobody drains while another
+  endpoint is still dialling; endpoints and pool members are dialled with
+  bounded concurrency (at most 8 in flight), so startup takes the slowest
+  batch instead of the sum of every member's dial. A configuration failure
+  still rolls back every connection that succeeded, late finishers included.
+  `Start` is single-shot per instance: a second call returns
+  `ErrAlreadyStarted` without touching the running endpoints.
+
 ## [1.8.1] - 2026-10-15
 
 ### Changed
@@ -209,7 +245,8 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.1...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.2...HEAD
+[1.8.2]: https://github.com/Jolly23/natslink/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/Jolly23/natslink/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/Jolly23/natslink/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/Jolly23/natslink/compare/v1.6.1...v1.7.0
