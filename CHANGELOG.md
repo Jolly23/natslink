@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-10-15
+
+### Changed
+- Failed publishes on the common nats.go sentinels (`ErrReconnectBufExceeded`,
+  `ErrMaxPayload`, ...) no longer pay a regexp pass in `redactError` when the
+  message cannot contain a URL: about 70 ns and one allocation instead of
+  about 800 ns and four. Credential-fragment and structured URL redaction are
+  unchanged (`BenchmarkRedactError`).
+- Pool routing keeps its fallback candidates on the stack for up to eight
+  members, so a reconnect or rebuild window no longer adds an allocation to
+  every publish (`BenchmarkPoolRoutingAllDisconnected`).
+
 ## [1.8.0] - 2026-10-14
 
 ### Added
@@ -197,7 +209,8 @@ First public release as a standalone Go module at
   pool with visible drops, `SyncMode` and `GoPerMessage` dispatch, periodic
   status reporting, `Probe` / `MustProbe`.
 
-[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/Jolly23/natslink/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/Jolly23/natslink/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/Jolly23/natslink/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/Jolly23/natslink/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/Jolly23/natslink/compare/v1.6.0...v1.6.1
