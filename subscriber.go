@@ -3,6 +3,8 @@ package natslink
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,19 +197,33 @@ type Subscriber struct {
 	//     reading link.Conn() would return the dead old connection and leave the
 	//     new one unsubscribed);
 	//   - subs: each link's currently live subscription handle (empty while paused);
-	//   - healing: whether the reconcile goroutine is running (see reconcileLocked / heal).
-	subMu   sync.Mutex
-	paused  bool
-	conns   map[*link]*nats.Conn
-	subs    map[*link]*nats.Subscription
-	healing bool
-	pauses  atomic.Uint64 // number of successful Pause transitions (Stats.Pauses)
+	//   - healing: whether the reconcile goroutine is running (see reconcileLocked / heal);
+	//   - rejections: consecutive server-side rejections of each link's SUB on
+	//     its current connection (permissions violation), reset when the link
+	//     sets up a new connection. It seeds the healer's retry wait so a
+	//     persistently denied subject is retried on the rebuild backoff
+	//     schedule (2s doubling to 30s) rather than every 2s;
+	//   - gen: per link, bumped on every handle install / removal; a probe
+	//     (see probe) acts only if the generation it observed is unchanged.
+	subMu      sync.Mutex
+	paused     bool
+	conns      map[*link]*nats.Conn
+	subs       map[*link]*nats.Subscription
+	healing    bool
+	rejections map[*link]int
+	gen        map[*link]uint64
+	pauses     atomic.Uint64 // number of successful Pause transitions (Stats.Pauses)
 
 	// Test hooks: when non-nil they are called before the real SUB / UNSUB and a
 	// non-nil return is treated as that call failing. Read only on the control
 	// plane (under subMu), always nil in production; tests set them while holding subMu.
-	testSubscribeErr   func() error
-	testUnsubscribeErr func() error
+	testSubscribeErr func() error
+	// testProbe, when set, replaces the network probe (see probeConn); and
+	// testBeforeProbeApply, when set, runs between a probe's network phase
+	// and its apply phase (hooks for the rejection tests, no server needed).
+	testProbe            func(conn *nats.Conn) probeVerdict
+	testBeforeProbeApply func()
+	testUnsubscribeErr   func() error
 
 	pendingMsgLimit   int
 	pendingBytesLimit int
@@ -244,6 +260,8 @@ func newSubscriber(urls []string, o SubscriberOptions, mirrored bool) (*Subscrib
 		pendingBytesLimit: o.PendingBytesLimit,
 		conns:             make(map[*link]*nats.Conn),
 		subs:              make(map[*link]*nats.Subscription),
+		rejections:        make(map[*link]int),
+		gen:               make(map[*link]uint64),
 	}
 	switch {
 	case o.Workers >= 0: // worker-pool mode (0 = default size)
@@ -277,6 +295,7 @@ func newSubscriber(urls []string, o SubscriberOptions, mirrored bool) (*Subscrib
 		l := &link{}
 		l.init(opts, "sub")
 		l.setup = func(conn *nats.Conn) error { return s.subscribeConn(l, conn) }
+		l.onSubRejected = func(conn *nats.Conn, err error) { s.onSubscriptionRejected(l, conn, err) }
 		// Let each link's built-in status report (and link-level snapshot) reflect
 		// the real subscription-side backpressure: queue depth and overflow drops
 		// are Subscriber-wide values, so under mirroring every endpoint reports the same ones.
@@ -497,10 +516,11 @@ func (s *Subscriber) subscribeConn(l *link, conn *nats.Conn) error {
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
 	s.conns[l] = conn
+	delete(s.rejections, l) // a new connection starts with a clean rejection history
 	// The old connection's subscription dies with the old connection (the rebuild
 	// discards it after the swap), so drop the record first lest Pause call
 	// Unsubscribe on a dead connection.
-	delete(s.subs, l)
+	s.clearSub(l)
 	if s.paused {
 		return nil
 	}
@@ -508,8 +528,34 @@ func (s *Subscriber) subscribeConn(l *link, conn *nats.Conn) error {
 	if err != nil {
 		return err
 	}
-	s.subs[l] = sub
+	s.setSub(l, sub)
 	return nil
+}
+
+// noteRejection records one more consecutive rejection of l's SUB on its
+// current connection and makes sure the healer is running (unless paused, in
+// which case Resume re-subscribes). Caller holds subMu.
+func (s *Subscriber) noteRejection(l *link, err error) {
+	s.rejections[l]++
+	wait := rejectionBackoff(s.rejections[l])
+	l.o.Logger.Warn("[natslink] subscription rejected by server, retrying",
+		"client", l.o.Name, "topic", l.o.Topic, "rejections", s.rejections[l], "next_wait", wait, "err", err)
+	if !s.paused && !s.healing {
+		s.healing = true
+		go s.heal(wait)
+	}
+}
+
+// setSub / clearSub are the only writers of the handle map; each bumps the
+// link's generation so an in-flight probe sees the change. Caller holds subMu.
+func (s *Subscriber) setSub(l *link, sub *nats.Subscription) {
+	s.subs[l] = sub
+	s.gen[l]++
+}
+
+func (s *Subscriber) clearSub(l *link) {
+	delete(s.subs, l)
+	s.gen[l]++
 }
 
 // subscribe sends the SUB for this topic on conn and applies the client buffer limits. Caller holds subMu.
@@ -640,9 +686,173 @@ func (s *Subscriber) reconcileAndHealLocked() error {
 	errs, failed := s.reconcileLocked(false)
 	if len(failed) > 0 && !s.healing {
 		s.healing = true
-		go s.heal()
+		go s.heal(rebuildBackoff)
 	}
 	return errors.Join(errs...)
+}
+
+// probeVerdict is the outcome of asking the server whether this subscriber's
+// subject is currently permitted on a connection.
+type probeVerdict int
+
+const (
+	probeInconclusive probeVerdict = iota // not connected, or the round trip failed
+	probeAccepted
+	probeRejected
+)
+
+// onSubscriptionRejected is the link's async-error hook for a server-side
+// rejection of this subscription (see isSubscriptionRejection). A local
+// Subscribe succeeds before the server has said anything, so a recorded
+// handle proves nothing: the server's -ERR arrives later, nats.go never
+// retries the SUB, and without this the connection would stay healthy while
+// receiving nothing forever (an ACL repaired by a config reload never takes
+// effect). The callback is only a trigger, never evidence: it carries no
+// subscription identity, and nats.go's async-callback queue can deliver it
+// arbitrarily late, after the handle it concerned has been replaced. What it
+// triggers is a probe of the link's current state (see probe), which decides
+// from the server's answer now. Probes per link are coalesced.
+func (s *Subscriber) onSubscriptionRejected(l *link, conn *nats.Conn, err error) {
+	if !s.rejectionMatches(err) {
+		return
+	}
+	if !l.probing.CompareAndSwap(false, true) {
+		return
+	}
+	go s.probe(l, conn)
+}
+
+// probe decides whether l's subject is permitted on conn right now and acts
+// on the current handle accordingly:
+//   - rejected: the current handle (if any) is dropped and unsubscribed
+//     locally (nats.go would otherwise replay the rejected SUB on reconnect),
+//     Stats.Diverged shows the endpoint as unaligned, and the healer re-sends
+//     the SUB on the rebuild backoff schedule seeded by the number of
+//     consecutive rejections;
+//   - accepted: nothing; the error that triggered the probe was stale (it
+//     predated the current handle), which is the normal outcome after an ACL
+//     is repaired or a subscription is replaced;
+//   - inconclusive: nothing; the connection is not up, and the SUB is replayed
+//     (and, if still denied, rejected again) when it comes back.
+//
+// The network round trip runs without subMu, so a stalled peer delays only
+// this endpoint; the result is applied only if the link's connection and
+// handle generation are unchanged since the probe started.
+func (s *Subscriber) probe(l *link, conn *nats.Conn) {
+	defer l.probing.Store(false)
+	s.subMu.Lock()
+	ok := s.conns[l] == conn && !s.paused
+	gen := s.gen[l]
+	s.subMu.Unlock()
+	if !ok {
+		return
+	}
+	var verdict probeVerdict
+	if s.testProbe != nil {
+		verdict = s.testProbe(conn)
+	} else {
+		verdict = s.probeConn(conn)
+	}
+	if s.testBeforeProbeApply != nil {
+		s.testBeforeProbeApply()
+	}
+	if verdict != probeRejected {
+		return
+	}
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	if s.conns[l] != conn || s.paused || s.gen[l] != gen {
+		return // replaced or paused meanwhile: the verdict is about an older state
+	}
+	if sub, ok := s.subs[l]; ok {
+		s.clearSub(l)
+		_ = sub.Unsubscribe()
+	}
+	s.noteRejection(l, errors.New("subject denied on this connection (probe)"))
+}
+
+// probeConn asks the server whether this subscriber's subject is permitted
+// on conn: a temporary subscription on the same subject with a discarding
+// handler, one flush round trip, and the connection's LastError before and
+// after. The server answers a rejected SUB with -ERR before the PONG, and
+// nats.go records that error on the connection synchronously on its read
+// loop (before it queues any callback), so a new rejection naming this
+// subject between the two readings is the verdict for the probe itself,
+// independent of how late the async callbacks run. The probe never joins the
+// subscriber's queue group (a queue member would take messages from the real
+// handle), so a permission granted only to that queue group shows as a
+// rejection here; that is accepted as a spurious re-subscribe.
+func (s *Subscriber) probeConn(conn *nats.Conn) probeVerdict {
+	if conn.Status() != nats.CONNECTED {
+		return probeInconclusive
+	}
+	before := conn.LastError()
+	sub, err := conn.Subscribe(s.topic, func(*nats.Msg) {})
+	if err != nil {
+		return probeInconclusive
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := conn.FlushTimeout(flusherTimeout); err != nil {
+		return probeInconclusive
+	}
+	after := conn.LastError()
+	if after != before && isSubscriptionRejection(after) && s.rejectionMatches(after) {
+		return probeRejected
+	}
+	return probeAccepted
+}
+
+// rejectionMatches reports whether a permissions violation concerns this
+// subscriber: it must name this subject and queue group. The server formats
+// both names with Go's %q, so the quoted tokens are decoded before comparing
+// (a subject containing a backslash or a quote otherwise never matches its
+// own rejection).
+func (s *Subscriber) rejectionMatches(err error) bool {
+	subject, ok := quotedToken(rejectedSubjectRe, err.Error())
+	if !ok || subject != s.topic {
+		return false
+	}
+	queue, ok := quotedToken(rejectedQueueRe, err.Error())
+	if !ok {
+		queue = ""
+	}
+	return queue == s.queueGroup
+}
+
+// quotedToken extracts and unquotes the Go-quoted token captured by re.
+func quotedToken(re *regexp.Regexp, text string) (string, bool) {
+	m := re.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return "", false
+	}
+	v, err := strconv.Unquote(m[1])
+	if err != nil {
+		return "", false
+	}
+	return v, true
+}
+
+// The server's permission error text, as nats.go passes it through:
+// `Permissions Violation for Subscription to "subject" using queue "q"`,
+// with both names %q-quoted (escapes included).
+var (
+	rejectedSubjectRe = regexp.MustCompile(`Subscription to ("(?:[^"\\]|\\.)*")`)
+	rejectedQueueRe   = regexp.MustCompile(`using queue ("(?:[^"\\]|\\.)*")`)
+)
+
+// rejectionBackoff is the healer's first wait after the n-th consecutive
+// rejection on a connection: the rebuild schedule, 2s doubling to 30s.
+func rejectionBackoff(n int) time.Duration {
+	d := rebuildBackoff
+	for i := 1; i < n && d < rebuildBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, rebuildBackoffMax)
 }
 
 // reconcileLocked aligns each endpoint's subscription handle with the current
@@ -671,7 +881,7 @@ func (s *Subscriber) reconcileLocked(retry bool) (errs []error, failed []*link) 
 				failed = append(failed, l)
 				continue
 			}
-			delete(s.subs, l)
+			s.clearSub(l)
 			if retry {
 				l.o.Logger.Info("[natslink] unsubscribe retried after failed pause", "client", l.o.Name, "topic", l.o.Topic)
 			}
@@ -693,7 +903,7 @@ func (s *Subscriber) reconcileLocked(retry bool) (errs []error, failed []*link) 
 			failed = append(failed, l)
 			continue
 		}
-		s.subs[l] = sub
+		s.setSub(l, sub)
 		if retry {
 			l.o.Logger.Info("[natslink] subscribe retried after failed resume", "client", l.o.Name, "topic", l.o.Topic)
 		}
@@ -730,8 +940,8 @@ func (s *Subscriber) unsubscribe(sub *nats.Subscription) error {
 // buy nothing but one more path with different semantics plus compensation
 // logic for "state flipped while unlocked -> tear down the subscription just
 // created"; the risk outweighs the benefit.
-func (s *Subscriber) heal() {
-	backoff := rebuildBackoff
+func (s *Subscriber) heal(initial time.Duration) {
+	backoff := initial
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	for {

@@ -54,10 +54,12 @@ type link struct {
 	// discards the connection and retries.
 	setup func(*nats.Conn) error
 	// onSubRejected, when set by a Subscriber, is called from the async error
-	// callback with the server's rejection of this connection's subscription
-	// (permissions violation on the subscribed subject, subscription limit).
-	// It must not block (it runs on nats.go's async-callback goroutine).
+	// callback with the server's rejection of a subscription on this
+	// connection (permissions violation). It must not block: it runs on
+	// nats.go's async-callback goroutine.
 	onSubRejected func(conn *nats.Conn, err error)
+	// probing coalesces the Subscriber's probes of this link (see Subscriber.probe).
+	probing atomic.Bool
 	// testBeforeInstall, when set, runs between setup and the connection
 	// swap in start (a hook for the Stop-vs-Start race tests).
 	testBeforeInstall func()
@@ -160,10 +162,14 @@ func (l *link) dial() (*nats.Conn, error) {
 				l.slowConsumers.Add(1)
 			}
 			l.o.Logger.Warn("[natslink] ⚠️ async error", "client", l.o.Name, "topic", subject, "err", redactError(l.o.URL, err))
-			// A server-side rejection of the subscription (sub is nil here: the
-			// server names the subject only in the error text) is handed to the
-			// subscription supervision; the connection itself stays healthy and
-			// nats.go never retries the SUB.
+			// A server-side permissions rejection of a subscription (sub is nil
+			// here: the server names the subject only in the error text) is
+			// handed to the subscription supervision; the connection itself
+			// stays healthy and nats.go never retries the SUB. The server's
+			// subscription limit (ErrMaxSubscriptionsExceeded) is deliberately
+			// not routed there: it is a shared sentinel with no subject, and a
+			// probe would itself be rejected at the limit, so it stays an
+			// operator-visible log line.
 			if l.onSubRejected != nil && isSubscriptionRejection(err) {
 				l.onSubRejected(c, err)
 			}
@@ -420,12 +426,8 @@ func startAll[T any](items []T, start func(T) error, stop func(T)) error {
 // rejecting a subscription on this connection: a permissions violation on
 // subscribe (nats.go formats it with the server's text, which names the
 // subject as `Subscription to "<subject>"`; a publish violation says
-// `Publish to` and is not a subscription failure) or the server's
-// subscription limit.
+// `Publish to` and is not a subscription failure).
 func isSubscriptionRejection(err error) bool {
-	if errors.Is(err, nats.ErrMaxSubscriptionsExceeded) {
-		return true
-	}
 	return errors.Is(err, nats.ErrPermissionViolation) && strings.Contains(err.Error(), "Subscription to ")
 }
 
