@@ -153,6 +153,9 @@ type PublisherPool struct {
 	async   bool
 	running atomic.Bool
 	stopped atomic.Bool
+	started atomic.Bool // Start is single-shot at the pool level (a second Start must not roll back the first one's members)
+
+	testBeforeRegister func() // test hook between the member dials and the send-line registration
 	// stopMu orders Publish against Stop in a mirrored pool: Publish checks
 	// stopped and enqueues under the read lock, Stop flips stopped under the
 	// write lock before telling the send goroutines to exit, so no message can
@@ -354,17 +357,33 @@ func NewPublisherPool(n int, o PublisherOptions) (*PublisherPool, error) {
 
 // Start starts every connection in the pool; if any fails (configuration
 // error) the ones already started are stopped and that error is returned.
+//
+// Members are dialled with bounded concurrency (maxConcurrentDials): a slow
+// handshake on one endpoint's members no longer postpones the dial of an
+// independent endpoint by their count times the dial timeout.
 func (p *PublisherPool) Start() error {
 	if p.stopped.Load() {
 		return ErrStopped
 	}
-	for i, pub := range p.pubs {
-		if err := pub.Start(); err != nil {
-			for _, started := range p.pubs[:i] {
-				started.Stop()
-			}
-			return err
-		}
+	if p.started.Swap(true) {
+		return ErrAlreadyStarted
+	}
+	if err := startAll(p.dialOrder(), (*Publisher).Start, (*Publisher).Stop); err != nil {
+		return err
+	}
+	if p.testBeforeRegister != nil {
+		p.testBeforeRegister()
+	}
+	// Register the send lines and commit the running state in the same short
+	// critical section Stop uses to flip stopped, so a Stop that raced the
+	// dials either sees no send line registered yet (and this returns
+	// ErrStopped: the members have discarded their connections, link.start
+	// checks stopped) or waits for lines that are fully registered; a
+	// WaitGroup Add can never race Stop's Wait.
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	if p.stopped.Load() {
+		return ErrStopped
 	}
 	if p.async {
 		for _, g := range p.groups {
@@ -374,6 +393,27 @@ func (p *PublisherPool) Start() error {
 	}
 	p.running.Store(true)
 	return nil
+}
+
+// dialOrder interleaves the members across endpoints (member 0 of every
+// endpoint, then member 1, ...), so the bounded dial concurrency of startAll
+// is spread over endpoints: a slow first endpoint with eight or more members
+// would otherwise occupy every slot and postpone the first dial of an
+// independent healthy endpoint.
+func (p *PublisherPool) dialOrder() []*Publisher {
+	order := make([]*Publisher, 0, len(p.pubs))
+	for i := 0; ; i++ {
+		added := false
+		for _, g := range p.groups {
+			if i < len(g.pubs) {
+				order = append(order, g.pubs[i])
+				added = true
+			}
+		}
+		if !added {
+			return order
+		}
+	}
 }
 
 // MustStart is Start but panics on failure. Suited to fail-fast startup.

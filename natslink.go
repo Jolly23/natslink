@@ -53,7 +53,7 @@ import (
 // Version is the package version. It mirrors the git tag (vX.Y.Z) and is
 // logged at connection start, so operators can see which version each process
 // runs.
-const Version = "1.8.1"
+const Version = "1.8.2"
 
 var (
 	ErrAlreadyStarted = errors.New("natslink: already started")
@@ -213,6 +213,15 @@ const (
 	// leaking one connection that is still closing does not matter; a
 	// deterministic shutdown matters more than a graceful goodbye.
 	stopGrace = 5 * time.Second
+
+	// maxConcurrentDials bounds how many of an instance's connections are
+	// dialled at the same time by Start (a mirrored subscriber's endpoints, a
+	// pool's members). Starting them one after another made every later
+	// endpoint wait behind each earlier member's dial timeout (a 5s stall on
+	// one tree delayed a healthy one by members x 5s); starting all of them
+	// at once would turn a large pool into a dial storm against a server that
+	// is just coming back. Eight keeps startup bounded by the slowest batch.
+	maxConcurrentDials = 8
 
 	defaultReportInterval = time.Minute
 	defaultWorkers        = 8

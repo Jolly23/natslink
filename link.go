@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,16 @@ type link struct {
 	// swapped in (subscriber connections subscribe here); returning an error
 	// discards the connection and retries.
 	setup func(*nats.Conn) error
+	// onSubRejected, when set by a Subscriber, is called from the async error
+	// callback with the server's rejection of a subscription on this
+	// connection (permissions violation). It must not block: it runs on
+	// nats.go's async-callback goroutine.
+	onSubRejected func(conn *nats.Conn, err error)
+	// probing coalesces the Subscriber's probes of this link (see Subscriber.probe).
+	probing atomic.Bool
+	// testBeforeInstall, when set, runs between setup and the connection
+	// swap in start (a hook for the Stop-vs-Start race tests).
+	testBeforeInstall func()
 	// statsHook lets the owner inject shared fields into this connection's
 	// Stats snapshot (the Subscriber's queue level and overflow drop count).
 	// Without it the built-in status report (one line per connection when
@@ -140,7 +151,7 @@ func (l *link) dial() (*nats.Conn, error) {
 				"client", l.o.Name, "topic", l.o.Topic, "err", redactError(l.o.URL, c.LastError()))
 			go l.rebuild()
 		}),
-		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+		nats.ErrorHandler(func(c *nats.Conn, sub *nats.Subscription, err error) {
 			subject := ""
 			if sub != nil {
 				subject = sub.Subject
@@ -151,6 +162,17 @@ func (l *link) dial() (*nats.Conn, error) {
 				l.slowConsumers.Add(1)
 			}
 			l.o.Logger.Warn("[natslink] ⚠️ async error", "client", l.o.Name, "topic", subject, "err", redactError(l.o.URL, err))
+			// A server-side permissions rejection of a subscription (sub is nil
+			// here: the server names the subject only in the error text) is
+			// handed to the subscription supervision; the connection itself
+			// stays healthy and nats.go never retries the SUB. The server's
+			// subscription limit (ErrMaxSubscriptionsExceeded) is deliberately
+			// not routed there: it is a shared sentinel with no subject, and a
+			// probe would itself be rejected at the limit, so it stays an
+			// operator-visible log line.
+			if l.onSubRejected != nil && isSubscriptionRejection(err) {
+				l.onSubRejected(c, err)
+			}
 		}),
 	)
 
@@ -188,6 +210,16 @@ func (l *link) reconnectDelay(attempts int) time.Duration {
 // (the connection keeps retrying in the background), so an error returned here
 // is almost certainly a URL / parameter configuration error and should be
 // treated as fatal.
+//
+// Stop may run at any point of the initial dial. The authority for "Stop won"
+// is the stopped flag (stop sets it unconditionally, whereas running can be
+// flipped back to true by this method's own Swap if stop ran just before it):
+// it is checked after the dial and setup, and again after the connection is
+// installed, because stop looks at the connection exactly once and may have
+// seen nil. In both cases the connection is discarded here and ErrStopped is
+// returned, so a shutdown that returned never leaves a live connection behind.
+// A double close with stop (both saw the connection) is harmless: nats.go's
+// Close is idempotent.
 func (l *link) start() error {
 	if l.stopped.Load() {
 		return ErrStopped
@@ -209,7 +241,22 @@ func (l *link) start() error {
 			return redactError(l.o.URL, err)
 		}
 	}
+	if l.testBeforeInstall != nil {
+		l.testBeforeInstall()
+	}
+	if l.stopped.Load() {
+		discard(conn)
+		l.running.Store(false)
+		return ErrStopped
+	}
 	l.conn.Store(conn)
+	if l.stopped.Load() {
+		// stop may have passed over a nil connection before the store above.
+		l.conn.CompareAndSwap(conn, nil)
+		discard(conn)
+		l.running.Store(false)
+		return ErrStopped
+	}
 
 	if l.o.ReportInterval > 0 {
 		go l.reportLoop()
@@ -335,6 +382,55 @@ func (l *link) rebuild() {
 	}
 }
 
+// startAll starts every item with at most maxConcurrentDials attempts in
+// flight, waits for all of them (an attempt that is still dialling when
+// another fails is not abandoned), and on any failure stops every item that
+// succeeded, late finishers included, before returning the first error. Items
+// that returned an error have already cleaned up after themselves.
+func startAll[T any](items []T, start func(T) error, stop func(T)) error {
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, maxConcurrentDials)
+		mu      sync.Mutex
+		first   error
+		started []T
+	)
+	for _, it := range items {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(it T) {
+			defer func() { <-sem; wg.Done() }()
+			err := start(it)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				return
+			}
+			started = append(started, it)
+		}(it)
+	}
+	wg.Wait()
+	if first == nil {
+		return nil
+	}
+	for _, it := range started {
+		stop(it)
+	}
+	return first
+}
+
+// isSubscriptionRejection reports whether an async error is the server
+// rejecting a subscription on this connection: a permissions violation on
+// subscribe (nats.go formats it with the server's text, which names the
+// subject as `Subscription to "<subject>"`; a publish violation says
+// `Publish to` and is not a subscription failure).
+func isSubscriptionRejection(err error) bool {
+	return errors.Is(err, nats.ErrPermissionViolation) && strings.Contains(err.Error(), "Subscription to ")
+}
+
 // absorb accumulates the statistics of a connection that is being swapped
 // out, keeping Stats() monotonic across rebuilds.
 func (l *link) absorb(old *nats.Conn) {
@@ -417,6 +513,9 @@ func (l *link) IsConnected() bool {
 func (l *link) WaitConnected(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
+		if l.stopped.Load() {
+			return ErrStopped // a stopped instance is never ready, even if a socket lingers
+		}
 		if l.IsConnected() {
 			return nil
 		}
