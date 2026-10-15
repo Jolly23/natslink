@@ -161,9 +161,11 @@ func TestMirroredPublishQueueFullAccounting(t *testing.T) {
 	if err := p.Publish([]byte("m")); err != nil {
 		t.Fatalf("publish 0: %v", err)
 	}
+	// The send goroutine releases the slot reservation just after taking the
+	// message off the channel, so wait for the reservations, not the channel
+	// length, before counting on the remaining capacity.
 	waitFor(t, "first message picked up by both send goroutines", func() bool {
-		st := p.Stats()
-		return st[0].QueueLen == 0 && st[1].QueueLen == 0
+		return p.groups[0].queuedEntries.Load() == 0 && p.groups[1].queuedEntries.Load() == 0
 	})
 	for i := 1; i < 5; i++ {
 		if err := p.Publish([]byte("m")); err != nil {
