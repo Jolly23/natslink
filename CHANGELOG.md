@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.8.4] - 2026-10-22
+## [1.8.4] - 2026-10-23
 
 ### Fixed
 - Error redaction now splits URL userinfo before percent-decoding each
