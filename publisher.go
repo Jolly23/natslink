@@ -440,7 +440,9 @@ func (p *PublisherPool) WaitConnected(timeout time.Duration) error {
 // Members are closed in parallel: each blocks at most stopGrace (see
 // link.stop), and the parallelism makes the pool-level worst case max rather
 // than the sum, so the shutdown budget (e.g. systemd TimeoutStopSec) does not
-// shrink linearly with pool size.
+// shrink linearly with pool size. A mirrored pool first gives its send lines
+// one stopGrace to drain, then gives member closes another stopGrace; its total
+// budget is therefore about 2*stopGrace (10s), plus scheduling overhead.
 func (p *PublisherPool) Stop() {
 	p.stopOnce.Do(p.stop)
 }
@@ -461,9 +463,9 @@ func (p *PublisherPool) stop() {
 		for _, g := range p.groups {
 			close(g.done)
 		}
-		// Wait for the send lines in parallel, so the pool-level bound stays
-		// stopGrace (max), not endpoints x stopGrace (sum), exactly like the
-		// member Stop below.
+		// Wait for the send lines in parallel, so this phase is bounded by
+		// stopGrace (max), not endpoints x stopGrace (sum). The member Stop
+		// phase below has its own, separate stopGrace budget.
 		var lines sync.WaitGroup
 		for _, g := range p.groups {
 			lines.Add(1)

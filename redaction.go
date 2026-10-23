@@ -168,12 +168,15 @@ func secretForms(rawURL string) []string {
 		}
 		auth := part[start:at]
 		cur := []string{auth}
-		if decoded, decodeErr := url.PathUnescape(auth); decodeErr == nil {
-			cur = append(cur, decoded)
+		// Only a literal colon separates username and password. Splitting the
+		// decoded userinfo would mistake an encoded colon in the username for
+		// that separator, omitting the decoded password from the scrub list.
+		if user, password, ok := strings.Cut(auth, ":"); ok {
+			cur = append(cur, user, password)
 		}
 		for _, secret := range append([]string(nil), cur...) {
-			if user, password, ok := strings.Cut(secret, ":"); ok {
-				cur = append(cur, user, password)
+			if decoded, decodeErr := url.PathUnescape(secret); decodeErr == nil {
+				cur = append(cur, decoded)
 			}
 		}
 		base = append(base, cur...)

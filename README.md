@@ -40,6 +40,14 @@ go get github.com/Jolly23/natslink@latest
 
 Requires Go 1.25 or newer.
 
+The [Rust implementation](https://github.com/Jolly23/natslink-rs) follows the
+same behavior contract. New features and shared behavior changes use the same
+minor version in both implementations; implementation-specific fixes and
+maintenance use independent patch versions. Runtime-specific differences are
+documented in the Rust README. Shared cases live in
+[`testdata/contract-v1.json`](testdata/contract-v1.json); contributor rules are
+in [CONTRIBUTING.md](CONTRIBUTING.md#shared-behavior-with-rust).
+
 ## Mental model (read this first)
 
 1. **One connection = one subject = one self-supervising unit.** Need more
@@ -349,8 +357,12 @@ defer pub.Stop()
   window or half-open socket holding the write path's connection lock) cannot
   hang your shutdown; the close continues in the background.
   `PublisherPool.Stop` and mirrored `Subscriber.Stop` stop members in parallel,
-  so pool shutdown costs max, not sum. The normal path stays in the millisecond
-  range. Background: a production shutdown once hung until systemd sent SIGKILL
+  so closing the members costs the longest close, not their sum. A mirrored
+  publisher pool has two sequential phases: up to 5 s to drain its independent
+  send lines, then up to 5 s to close its members (about 10 s total, plus
+  scheduling overhead). A subscriber additionally waits for worker-pool
+  callbacks to return; that wait has no deadline. The normal path stays in the
+  millisecond range. Background: a production shutdown once hung until systemd sent SIGKILL
   because nats.go's `FlushTimeout(1s)` only bounds the wait for PONG, not the
   wait for the connection lock, and the lock was held by a write blocked on a
   60 s deadline. The same release cut the per-write socket deadline to 5 s
@@ -486,8 +498,9 @@ Semantics at a glance:
   its queue discarded (full, or left over when `Stop` gave up on a stalled
   send) in its `QueueDropped` (`queue_dropped=` in the status line). `Stop`
   lets every send goroutine flush its queue first, waits for them in parallel
-  for at most one stop grace, and a concurrent second `Stop` waits for that
-  same sequence. A single-endpoint pool keeps the synchronous `Publish` of the
+  for at most one stop grace, then closes the members in parallel with a second
+  stop grace (about 10 s total). A concurrent second `Stop` waits for that same
+  sequence. A single-endpoint pool keeps the synchronous `Publish` of the
   plain pool.
 - **Subscribers share one worker pool and one set of counters.** `Workers` is
   the **total** concurrency cap across endpoints and `QueueSize` is one shared
@@ -532,7 +545,8 @@ negative deltas to zero in rate monitors).
 | `Status` / `Connected` / `Server` / `Cluster` | Current connection state |
 | `Reconnects` | Successful automatic reconnects |
 | `Rebuilds` | Full connection rebuilds after a permanent close |
-| `InMsgs` / `OutMsgs` / `InBytes` / `OutBytes` | Traffic counters |
+| `InMsgs` / `OutMsgs` | Message copies received / accepted by the underlying client; these are transport counters, before subscriber filtering |
+| `InBytes` / `OutBytes` | Payload bytes plus encoded NATS header-block bytes; excludes subject/reply names, protocol control lines, framing CRLF, and TCP/TLS overhead. Header-free messages count only the payload. These are not total network bytes. |
 | `Dropped` | pub: failed publishes; sub: worker-queue overflow drops (**worker-pool mode only**; always 0 in sync and goroutine-per-message modes) |
 | `Gated` | sub: messages dropped by the `Gate` at the delivery entry point (all modes; 0 without a gate; counts copies under mirroring) |
 | `Deduped` | sub: copies dropped by the `DedupSet` after the gate and before the queue (all modes; 0 without a set; M-1 per message in a healthy M-endpoint mirror) |
