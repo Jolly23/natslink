@@ -62,8 +62,9 @@ in [CONTRIBUTING.md](CONTRIBUTING.md#shared-behavior-with-rust).
    | Runtime | **Permanent close** (fatal protocol error from the server) | automatic rebuild           | nothing; it never gives up             |
 
    Startup errors must crash you. Runtime failures must never bother you.
-   *A successful start is a promise: everything is ready, and the unit will
-   never stop trying.*
+   A successful start means supervision is running; the server may still be
+   unreachable and retried in the background. Use `WaitConnected` when startup
+   must wait for a connection. Connection readiness is not a delivery acknowledgement.
 3. **Instances are single-use.** After `Stop()` create a new one.
 4. **Supervision parameters are not configurable.** Dial timeout, reconnect and
    rebuild backoff, heartbeat probing and write deadlines are package constants
