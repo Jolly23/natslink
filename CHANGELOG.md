@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-10-23
+
+### Fixed
+- Error redaction now splits URL userinfo before percent-decoding each
+  credential. An encoded colon in a username could previously leave a
+  decoded password visible when an underlying error reported it separately.
+
+### Added
+- Shared Go/Rust behavioral fixtures for FIFO and age-bounded deduplication,
+  custom keys, subscriber admission order, empty payloads, cross-subject
+  sharing, and percent-encoded URL credentials.
+- Regression coverage for healthy mirrored publishing bursts and message
+  byte counters with NATS headers.
+
+### Changed
+- Document coordinated minor releases and independent patch releases for the
+  two implementations, while retaining the Go 1.25 minimum.
+- Clarify the mirrored publisher's two shutdown phases and the distinction
+  between message-byte counters and total network traffic. No data-path change.
+
 ## [1.8.3] - 2026-10-15
 
 ### Changed

@@ -13,6 +13,30 @@
   `redaction_test.go` or `redaction_quoted_test.go`.
 - No business logic and no dependencies beyond `nats.go` and the standard
   library.
+- Keep documentation, comments, examples and change notes independent of any
+  private deployment. Use synthetic credentials and loopback test endpoints.
+- Go 1.25 is the supported minimum; do not raise it as a side effect of a
+  dependency or tooling update.
+
+## Shared behavior with Rust
+
+The [Rust crate](https://github.com/Jolly23/natslink-rs) implements the same
+design. New features and shared behavior changes belong in the same minor
+release of both implementations. A fix or maintenance change confined to one
+implementation uses that implementation's next patch version; patch numbers
+do not have to match. Each implementation should use its runtime efficiently.
+Differences required by the underlying NATS clients must be explained in the
+Rust README's comparison table and covered by tests.
+
+`testdata/contract-v1.json` is the shared behavioral fixture. Keep its copy in
+both repositories identical. `TestSharedContract` executes it against the real
+deduplicator, subscriber dispatch and credential handshake paths. Contract
+changes must update both runners and fixture copies, rather than merely
+updating a version reference. Run the local cases with:
+
+```bash
+go test -short -run '^TestSharedContract$' -count=1 .
+```
 
 ## Running the tests
 
@@ -90,7 +114,8 @@ make one casually.
    runs the unit tests, and creates the GitHub release whose body is the
    matching `## [X.Y.Z]` section of `CHANGELOG.md`
    (`.github/scripts/changelog_section.sh`). A version mismatch or a missing
-   CHANGELOG section fails the workflow; delete the tag, fix, and tag again.
+   CHANGELOG section fails the workflow. If a tag was already pushed, correct
+   the release in a new patch version; never replace a published tag.
 
 Consumers then upgrade with `go get github.com/Jolly23/natslink@v1.6.0`.
 The Go module proxy caches tags permanently, so never move or delete a tag

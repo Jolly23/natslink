@@ -53,7 +53,7 @@ import (
 // Version is the package version. It mirrors the git tag (vX.Y.Z) and is
 // logged at connection start, so operators can see which version each process
 // runs.
-const Version = "1.8.3"
+const Version = "1.8.4"
 
 var (
 	ErrAlreadyStarted = errors.New("natslink: already started")
@@ -328,10 +328,10 @@ type Stats struct {
 
 	Reconnects uint64 // Successful client automatic reconnects (RECONNECTING -> CONNECTED).
 	Rebuilds   uint64 // Whole-connection self-healing rebuilds after a "permanent close" (excluding the initial connect).
-	InMsgs     uint64 // Messages received.
-	OutMsgs    uint64 // Messages sent.
-	InBytes    uint64 // Bytes received.
-	OutBytes   uint64 // Bytes sent.
+	InMsgs     uint64 // Message copies received, before subscriber filtering.
+	OutMsgs    uint64 // Messages accepted by the underlying client; not delivery acknowledgments.
+	InBytes    uint64 // Received payload + encoded NATS header-block bytes; excludes protocol/TCP/TLS overhead.
+	OutBytes   uint64 // Accepted payload + encoded NATS header-block bytes; excludes protocol/TCP/TLS overhead.
 
 	// Dropped is, for a Publisher, the number of failed publishes (rebuild
 	// window / buffer overflow); for a Subscriber, the number of messages
